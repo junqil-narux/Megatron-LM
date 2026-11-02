@@ -188,10 +188,15 @@ class _RowSparseGradEmbedding(torch.autograd.Function):
             if row_ids.numel() > 0:
                 if ctx.deterministic:
                     rows, row_grads = _sorted_segment_row_grads(row_ids, grad_output)
+                    row_grads = row_grads.to(weight.dtype).to(main_grad.dtype)
+                    # Distinct rows: the sorted accumulation adds each of them exactly once.
+                    main_grad.index_put_((rows,), row_grads, accumulate=True)
                 else:
                     rows, row_grads = _compacted_embedding_row_grads(row_ids, grad_output)
-                row_grads = row_grads.to(weight.dtype).to(main_grad.dtype)
-                main_grad.index_put_((rows,), row_grads, accumulate=True)
+                    row_grads = row_grads.to(weight.dtype).to(main_grad.dtype)
+                    # The padding rows all point at row 0. index_put_ would walk that duplicate run
+                    # serially; atomic adds keep it parallel, and adding +0 is exact in any order.
+                    main_grad.index_add_(0, rows, row_grads)
             weight.grad_added_to_main_grad = True
             return weight.detach(), None, None
         finally:
