@@ -234,6 +234,15 @@ class EngramConfig:
     the reference otherwise; ``"reference"`` always runs the PyTorch op chain. The
     ``MEGATRON_ENGRAM_DENSE_IMPL`` environment variable overrides this at module build time.
     """
+    row_sparse_grad: bool = False
+    """Add each table's gradient into the DDP ``main_grad`` buffer only for the touched rows.
+
+    The default backward materializes a zero gradient as large as the local table shard on every
+    microbatch, and the DDP hook adds all of it into ``main_grad``. With this set, backward sums
+    and rounds the touched rows exactly as the dense gradient would and adds only those rows, so
+    ``main_grad`` is unchanged bit for bit. Tables without a ``main_grad`` (not wrapped in MCore
+    DDP) and ``zero_out_wgrad`` tables keep the dense gradient.
+    """
     variant_spec: EngramVariant = field(init=False, repr=False)
     tokenizer_remap: torch.Tensor | None = field(init=False, repr=False, default=None)
     hash_boundary_token_id: int = field(init=False)
@@ -288,6 +297,7 @@ class EngramConfig:
             unigram_vocab_size=getattr(args, "engram_unigram_vocab_size", None),
             embedding_lr_multiplier=args.engram_embedding_lr_multiplier,
             embedding_weight_decay=args.engram_embedding_weight_decay,
+            row_sparse_grad=getattr(args, "engram_row_sparse_grad", False),
         )
         packed_sequences = _validate_packed_sequence_args(args)
         config.validate_startup(

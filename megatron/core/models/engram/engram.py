@@ -339,6 +339,7 @@ class Engram(MegatronModule):
             ep_group=pg_collection.ep,
             tp_group=pg_collection.tp,
             expt_dp_group=pg_collection.expt_dp,
+            row_sparse_grad=getattr(engram_config, "row_sparse_grad", False),
         )
         factory_kwargs = {"device": device, "dtype": config.params_dtype}
         # Official Qwen PLE layout: one fused key projection over all residual streams, one

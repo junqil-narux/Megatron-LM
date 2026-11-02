@@ -5380,6 +5380,13 @@ def _add_engram_args(parser):
     group.add_argument('--engram-embedding-lr-multiplier', type=float, default=5.0)
     group.add_argument('--engram-embedding-weight-decay', type=float, default=0.0)
     group.add_argument(
+        '--engram-row-sparse-grad',
+        action='store_true',
+        help='Add Engram table gradients into the DDP main_grad buffer only for the rows each '
+        'microbatch touches, instead of materializing and adding a gradient as large as the '
+        'table shard. main_grad is bitwise unchanged.',
+    )
+    group.add_argument(
         '--engram-verify-training',
         action='store_true',
         help='Synchronously verify and log sparse-table gradients and updates each step.',

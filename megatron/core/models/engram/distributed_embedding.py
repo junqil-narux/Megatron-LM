@@ -59,6 +59,59 @@ class _DifferentiableEngramAllToAll(torch.autograd.Function):
         return None, grad_input, None, None
 
 
+def _sorted_segment_row_grads(row_ids: Tensor, grad_output: Tensor) -> tuple[Tensor, Tensor]:
+    """Sum the gradients of repeated rows in sorted, segmented order.
+
+    Returns the distinct rows and their sums, accumulated in FP32 for 16-bit gradients. The
+    distinct-row count is data dependent, so this synchronizes with the host once.
+    """
+    accumulation_dtype = (
+        torch.float32 if grad_output.dtype in (torch.float16, torch.bfloat16) else grad_output.dtype
+    )
+    order = torch.argsort(row_ids, stable=True)
+    sorted_rows = row_ids.index_select(0, order)
+    sorted_grads = grad_output.index_select(0, order).to(accumulation_dtype)
+    unique_rows, counts = torch.unique_consecutive(sorted_rows, return_counts=True)
+    row_grads = torch.segment_reduce(sorted_grads, "sum", lengths=counts)
+    return unique_rows, row_grads
+
+
+def _compacted_embedding_row_grads(row_ids: Tensor, grad_output: Tensor) -> tuple[Tensor, Tensor]:
+    """Return ``F.embedding``'s weight gradient restricted to the touched rows.
+
+    Row IDs are renumbered to their rank among the distinct IDs. The renumbering is monotone and
+    keeps equal IDs equal, so ``embedding_dense_backward`` groups, orders and sums the requests
+    exactly as it does for the original IDs and returns the dense gradient's rows bit for bit.
+    The distinct-row count stays on the device: both outputs have one row per request, and the
+    rows past the distinct count carry a zero gradient and point at local row 0.
+    """
+    num_requests = row_ids.numel()
+    sorted_rows, order = torch.sort(row_ids)
+    is_first = torch.ones_like(sorted_rows, dtype=torch.bool)
+    is_first[1:] = sorted_rows[1:] != sorted_rows[:-1]
+    sorted_ranks = torch.cumsum(is_first, dim=0) - 1
+    compact_ids = torch.empty_like(row_ids).index_copy_(0, order, sorted_ranks)
+    # Requests that share a rank carry the same row ID, so the duplicate writes agree.
+    rows = torch.zeros_like(row_ids).scatter_(0, sorted_ranks, sorted_rows)
+    row_grads = torch.ops.aten.embedding_dense_backward(
+        grad_output, compact_ids, num_requests, -1, False
+    )
+    return rows, row_grads
+
+
+def _accumulates_into_main_grad(weight: Tensor) -> bool:
+    """Whether backward may add the table gradient straight into ``weight.main_grad``.
+
+    That needs the MCore DDP gradient buffer, whose backward hook skips a gradient already
+    added (``grad_added_to_main_grad``). ``zero_out_wgrad`` parameters expect a real gradient.
+    """
+    return (
+        getattr(weight, "main_grad", None) is not None
+        and hasattr(weight, "grad_added_to_main_grad")
+        and not getattr(weight, "zero_out_wgrad", False)
+    )
+
+
 class _DeterministicEmbedding(torch.autograd.Function):
     """Embedding lookup with sorted, segmented accumulation for repeated-row gradients."""
 
@@ -77,24 +130,70 @@ class _DeterministicEmbedding(torch.autograd.Function):
         nvtx_range_push(message)
         try:
             (row_ids,) = ctx.saved_tensors
-            accumulation_dtype = (
-                torch.float32
-                if grad_output.dtype in (torch.float16, torch.bfloat16)
-                else grad_output.dtype
-            )
             # The table shard is large, so allocate the dense gradient once in its final dtype
             # and keep the higher-precision accumulation to the touched rows.
             grad_weight = torch.zeros(
                 ctx.weight_shape, dtype=ctx.weight_dtype, device=grad_output.device
             )
             if row_ids.numel() > 0:
-                order = torch.argsort(row_ids, stable=True)
-                sorted_rows = row_ids.index_select(0, order)
-                sorted_grads = grad_output.index_select(0, order).to(accumulation_dtype)
-                unique_rows, counts = torch.unique_consecutive(sorted_rows, return_counts=True)
-                row_grads = torch.segment_reduce(sorted_grads, "sum", lengths=counts)
+                unique_rows, row_grads = _sorted_segment_row_grads(row_ids, grad_output)
                 grad_weight.index_copy_(0, unique_rows, row_grads.to(ctx.weight_dtype))
             return grad_weight, None
+        finally:
+            nvtx_range_pop(message)
+
+
+class _RowSparseGradEmbedding(torch.autograd.Function):
+    """Embedding lookup whose backward adds only the touched rows into ``main_grad``.
+
+    The dense backward materializes a zero gradient as large as the table shard on every
+    microbatch, and the DDP hook then adds all of it into ``main_grad``. Here the touched rows'
+    gradients are computed exactly as the dense backward computes them (the sorted segment sum
+    in deterministic mode, otherwise ``F.embedding``'s own kernel), rounded to the parameter
+    dtype like the dense gradient, and added into those rows of ``main_grad`` in its dtype.
+    Every other row would only have received ``+0``, so ``main_grad`` matches the dense path bit
+    for bit. Autograd gets a zero-allocation sentinel that aliases the parameter; with
+    ``grad_added_to_main_grad`` set, the DDP hook drops it unread.
+    """
+
+    @staticmethod
+    def forward(ctx, weight: Tensor, row_ids: Tensor, deterministic: bool) -> Tensor:
+        """Gather ``weight`` rows at ``row_ids``."""
+        ctx.save_for_backward(row_ids)
+        ctx.weight = weight
+        ctx.deterministic = deterministic
+        return weight.index_select(0, row_ids)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, None, None]:
+        """Add the touched rows' gradients into ``main_grad`` and return the sentinel."""
+        message = "engram.embedding.backward"
+        nvtx_range_push(message)
+        try:
+            (row_ids,) = ctx.saved_tensors
+            weight = ctx.weight
+            main_grad = weight.main_grad
+            if main_grad.shape != weight.shape:
+                raise RuntimeError(
+                    f"Engram row-sparse gradient needs main_grad shaped like the table shard, "
+                    f"got {tuple(main_grad.shape)} for {tuple(weight.shape)}."
+                )
+            if weight.grad is not None:
+                # The sentinel aliases the parameter: accumulating it onto a gradient the DDP
+                # hook has not cleared could write into the table itself.
+                raise RuntimeError(
+                    "Engram row-sparse gradient found a table .grad that the DDP backward hook "
+                    "did not clear."
+                )
+            if row_ids.numel() > 0:
+                if ctx.deterministic:
+                    rows, row_grads = _sorted_segment_row_grads(row_ids, grad_output)
+                else:
+                    rows, row_grads = _compacted_embedding_row_grads(row_ids, grad_output)
+                row_grads = row_grads.to(weight.dtype).to(main_grad.dtype)
+                main_grad.index_put_((rows,), row_grads, accumulate=True)
+            weight.grad_added_to_main_grad = True
+            return weight.detach(), None, None
         finally:
             nvtx_range_pop(message)
 
@@ -125,6 +224,7 @@ class EPShardedEmbeddingTable(MegatronModule):
         ep_group=None,
         tp_group=None,
         expt_dp_group=None,
+        row_sparse_grad: bool = False,
     ) -> None:
         super().__init__(config=config)
         self.global_num_embeddings = global_num_embeddings
@@ -132,6 +232,7 @@ class EPShardedEmbeddingTable(MegatronModule):
         self.tp_group = tp_group
         self.expt_dp_group = expt_dp_group
         self.deterministic_mode = getattr(config, "deterministic_mode", False)
+        self.row_sparse_grad = row_sparse_grad
         self.ep_rank = get_pg_rank(ep_group)
         self.ep_size = get_pg_size(ep_group)
         self.row_start, self.row_end = get_contiguous_row_range(
@@ -188,6 +289,10 @@ class EPShardedEmbeddingTable(MegatronModule):
 
     def forward(self, local_row_ids: Tensor) -> Tensor:
         """Look up owner-local row IDs."""
+        if self.row_sparse_grad and _accumulates_into_main_grad(self.weight):
+            return _RowSparseGradEmbedding.apply(
+                self.weight, local_row_ids, self.deterministic_mode
+            )
         if self.deterministic_mode:
             return _DeterministicEmbedding.apply(self.weight, local_row_ids)
         return F.embedding(local_row_ids, self.weight)
@@ -233,6 +338,7 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         ep_group=None,
         tp_group=None,
         expt_dp_group=None,
+        row_sparse_grad: bool = False,
     ) -> None:
         super().__init__(config=config)
         self.table_sizes = tuple(table_sizes)
@@ -249,6 +355,7 @@ class EPShardedMultiTableEmbedding(MegatronModule):
                     ep_group=ep_group,
                     tp_group=tp_group,
                     expt_dp_group=expt_dp_group,
+                    row_sparse_grad=row_sparse_grad,
                 )
                 for table_size in self.table_sizes
             ]
