@@ -99,6 +99,17 @@ class _DeterministicEmbedding(torch.autograd.Function):
             nvtx_range_pop(message)
 
 
+def count_requests_per_bucket(buckets: Tensor, num_buckets: int) -> Tensor:
+    """Return the int64 request count of every bucket in ``[0, num_buckets)``.
+
+    Equals ``torch.bincount(buckets, minlength=num_buckets)``, but ``bincount`` reads the input's
+    minimum and maximum on the host (two device synchronizations per call); a scatter-add into a
+    buffer of known size needs none. Every bucket must lie in ``[0, num_buckets)``.
+    """
+    counts = torch.zeros(num_buckets, dtype=torch.int64, device=buckets.device)
+    return counts.scatter_add_(0, buckets, torch.ones_like(buckets))
+
+
 def get_contiguous_row_range(global_rows: int, rank: int, world_size: int) -> tuple[int, int]:
     """Return the balanced, unpadded contiguous row interval owned by ``rank``."""
     if global_rows < 0:
@@ -373,9 +384,9 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             # Count per (peer, table) rather than per peer: the same exchange then yields the
             # all-to-all splits and the owner-side per-table counts from one host transfer.
             num_tables = len(self.tables)
-            send_counts = torch.bincount(
-                sorted_owners * num_tables + requests[:, 0], minlength=self.ep_size * num_tables
-            ).to(torch.int64)
+            send_counts = count_requests_per_bucket(
+                sorted_owners * num_tables + requests[:, 0], self.ep_size * num_tables
+            )
             recv_counts = torch.empty_like(send_counts)
         finally:
             nvtx_range_pop(message)
