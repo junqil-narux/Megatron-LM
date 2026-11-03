@@ -1913,6 +1913,8 @@ def validate_args(args, defaults={}):
             "--engram-verify-training reads full gradients from main_grad and is incompatible "
             "with --use-distributed-optimizer, which reduce-scatters the gradient buffer."
         )
+    if getattr(args, "engram_async_lookup", False):
+        assert args.engram_enabled, "--engram-async-lookup requires Engram to be enabled."
 
     # MoE router check
     if (

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
@@ -232,6 +233,74 @@ class EPShardedEmbeddingTable(MegatronModule):
         }
 
 
+@dataclass
+class EngramRoute:
+    """Owner routing of one EP lookup.
+
+    ``EPShardedMultiTableEmbedding.route`` fills the device tensors; the host-side splits come
+    from ``exchange_route_counts``.
+
+    Attributes:
+        shape: Shape of the routed ``hash_ids`` (``[..., num_tables]``).
+        owner_order: Permutation that sorts the flattened requests by owner.
+        requests: ``[num_requests, 2]`` (table, owner-local row) pairs in owner order.
+        send_counts: Requests per (owner, table), owner-major.
+        send_splits: Requests sent to each owner.
+        recv_splits: Requests received from each peer.
+        table_counts: Received requests per table.
+    """
+
+    shape: torch.Size
+    owner_order: Tensor
+    requests: Tensor
+    send_counts: Tensor
+    send_splits: Optional[list[int]] = None
+    recv_splits: Optional[list[int]] = None
+    table_counts: Optional[list[int]] = None
+
+
+def exchange_route_counts(routes: list[EngramRoute], ep_size: int, num_tables: int, group) -> None:
+    """Exchange the request counts of ``routes`` and fill in their host-side splits.
+
+    One all-to-all and one host transfer serve every route, so the counts of several lookups
+    (all microbatches and Engram layers of a step) cost a single host synchronization. The
+    transfer synchronizes only with the current stream.
+
+    Args:
+        routes: Routes on this rank, in the same order on every rank of ``group``; all of them
+            route ``num_tables`` tables over ``ep_size`` owners.
+        ep_size: Number of owners (the size of ``group``).
+        num_tables: Tables per route.
+        group: Group with the owners' ranks, in owner order.
+    """
+    if len(routes) == 1:
+        send_counts = routes[0].send_counts
+    else:
+        # [routes, peers, tables] -> [peers, routes, tables]: each peer receives one contiguous
+        # block holding its counts of every route.
+        send_counts = torch.stack(
+            [route.send_counts.view(ep_size, num_tables) for route in routes], dim=1
+        ).reshape(-1)
+    recv_counts = torch.empty_like(send_counts)
+
+    message = "engram.lookup.count-a2a"
+    nvtx_range_push(message)
+    try:
+        torch.distributed.all_to_all_single(recv_counts, send_counts, group=group)
+    finally:
+        nvtx_range_pop(message)
+    sent, received = torch.stack((send_counts, recv_counts)).tolist()
+
+    per_peer = len(routes) * num_tables
+    for index, route in enumerate(routes):
+        offsets = [peer * per_peer + index * num_tables for peer in range(ep_size)]
+        route.send_splits = [sum(sent[offset : offset + num_tables]) for offset in offsets]
+        route.recv_splits = [sum(received[offset : offset + num_tables]) for offset in offsets]
+        route.table_counts = [
+            sum(received[offset + table] for offset in offsets) for table in range(num_tables)
+        ]
+
+
 class EPShardedMultiTableEmbedding(MegatronModule):
     """Batch variable-size requests for multiple independently EP-sharded tables."""
 
@@ -328,29 +397,23 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         output.index_copy_(0, order, torch.cat(values))
         return output
 
-    def forward(self, hash_ids: Tensor) -> Tensor:
-        """Route global table rows to owners and restore token/head ordering.
-
-        Args:
-            hash_ids: Per-table row IDs with shape ``[..., num_tables]``.
-
-        Returns:
-            Retrieved embeddings with shape ``[..., num_tables, embedding_dim]``.
-        """
+    def _check_hash_heads(self, hash_ids: Tensor) -> None:
         if hash_ids.shape[-1] != len(self.tables):
             raise ValueError(
                 f"Expected {len(self.tables)} Engram hash heads, got {hash_ids.shape[-1]}."
             )
+
+    def route(self, hash_ids: Tensor) -> EngramRoute:
+        """Map global table rows to their owners and count the requests per (owner, table).
+
+        Device work only; the counts still have to be exchanged (``exchange_route_counts``)
+        before ``lookup_routed`` can run. Needs EP > 1.
+
+        Args:
+            hash_ids: Per-table row IDs with shape ``[..., num_tables]``.
+        """
+        self._check_hash_heads(hash_ids)
         original_shape = hash_ids.shape
-
-        if self.ep_size == 1:
-            # Per-table layout is statically known: no routing, sorting, or host sync needed.
-            values = [
-                table(hash_ids[..., table_id].reshape(-1).to(torch.int64))
-                for table_id, table in enumerate(self.tables)
-            ]
-            return torch.stack(values, dim=-2).view(*original_shape, self.embedding_dim)
-
         rows = hash_ids.reshape(-1).to(torch.int64)
         table_ids = (
             torch.arange(len(self.tables), device=hash_ids.device, dtype=torch.int64)
@@ -387,37 +450,50 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             send_counts = count_requests_per_bucket(
                 sorted_owners * num_tables + requests[:, 0], self.ep_size * num_tables
             )
-            recv_counts = torch.empty_like(send_counts)
         finally:
             nvtx_range_pop(message)
+        return EngramRoute(
+            shape=original_shape,
+            owner_order=owner_order,
+            requests=requests,
+            send_counts=send_counts,
+        )
 
-        message = "engram.lookup.count-a2a"
-        nvtx_range_push(message)
-        try:
-            torch.distributed.all_to_all_single(recv_counts, send_counts, group=self.ep_group)
-        finally:
-            nvtx_range_pop(message)
-        sent, received = torch.stack((send_counts, recv_counts)).tolist()
-        peer_slices = [
-            slice(peer * num_tables, (peer + 1) * num_tables) for peer in range(self.ep_size)
-        ]
-        send_splits = [sum(sent[peer]) for peer in peer_slices]
-        recv_splits = [sum(received[peer]) for peer in peer_slices]
-        table_counts = [
-            sum(received[peer * num_tables + table] for peer in range(self.ep_size))
-            for table in range(num_tables)
-        ]
+    def exchange_route_counts(self, routes: list[EngramRoute], group=None) -> None:
+        """Exchange the request counts of ``routes`` over ``group`` (default: the EP group).
 
-        received_requests = requests.new_empty((sum(recv_splits), 2))
+        See ``exchange_route_counts``; any other group must have the EP group's ranks in the
+        same order.
+        """
+        exchange_route_counts(
+            routes, self.ep_size, len(self.tables), self.ep_group if group is None else group
+        )
+
+    def lookup_routed(self, route: EngramRoute, group=None) -> Tensor:
+        """Fetch the routed rows from their owners and restore token/head ordering.
+
+        Args:
+            route: A route whose counts were exchanged.
+            group: Group for the request and return all-to-alls (and the return all-to-all's
+                backward); defaults to the EP group. Any other group must have the same ranks
+                in the same order.
+
+        Returns:
+            Retrieved embeddings with shape ``[..., num_tables, embedding_dim]``.
+        """
+        if route.send_splits is None:
+            raise RuntimeError("Engram lookup_routed needs a route whose counts were exchanged.")
+        group = self.ep_group if group is None else group
+        received_requests = route.requests.new_empty((sum(route.recv_splits), 2))
         message = "engram.lookup.request-a2a"
         nvtx_range_push(message)
         try:
             torch.distributed.all_to_all_single(
                 received_requests,
-                requests.contiguous(),
-                output_split_sizes=recv_splits,
-                input_split_sizes=send_splits,
-                group=self.ep_group,
+                route.requests.contiguous(),
+                output_split_sizes=route.recv_splits,
+                input_split_sizes=route.send_splits,
+                group=group,
             )
         finally:
             nvtx_range_pop(message)
@@ -425,12 +501,34 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         message = "engram.lookup.local-embedding"
         nvtx_range_push(message)
         try:
-            owner_embeddings = self._lookup_received_requests(received_requests, table_counts)
+            owner_embeddings = self._lookup_received_requests(received_requests, route.table_counts)
         finally:
             nvtx_range_pop(message)
         sorted_embeddings = _DifferentiableEngramAllToAll.apply(
-            self.ep_group, owner_embeddings, send_splits, recv_splits
+            group, owner_embeddings, route.send_splits, route.recv_splits
         )
         output = torch.empty_like(sorted_embeddings)
-        output.index_copy_(0, owner_order, sorted_embeddings)
-        return output.view(*original_shape, self.embedding_dim)
+        output.index_copy_(0, route.owner_order, sorted_embeddings)
+        return output.view(*route.shape, self.embedding_dim)
+
+    def forward(self, hash_ids: Tensor) -> Tensor:
+        """Route global table rows to owners and restore token/head ordering.
+
+        Args:
+            hash_ids: Per-table row IDs with shape ``[..., num_tables]``.
+
+        Returns:
+            Retrieved embeddings with shape ``[..., num_tables, embedding_dim]``.
+        """
+        self._check_hash_heads(hash_ids)
+        if self.ep_size == 1:
+            # Per-table layout is statically known: no routing, sorting, or host sync needed.
+            values = [
+                table(hash_ids[..., table_id].reshape(-1).to(torch.int64))
+                for table_id, table in enumerate(self.tables)
+            ]
+            return torch.stack(values, dim=-2).view(*hash_ids.shape, self.embedding_dim)
+
+        route = self.route(hash_ids)
+        self.exchange_route_counts([route])
+        return self.lookup_routed(route)

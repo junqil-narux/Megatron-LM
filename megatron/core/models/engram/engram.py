@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from collections import deque
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +22,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
 
+from .async_lookup import EngramLookupHandle, get_lookup_group, get_lookup_stream
 from .config import EngramConfig
 from .cp_layout import (
     gather_sequence,
@@ -293,6 +295,9 @@ class _ContextParallelConvHalo(torch.autograd.Function):
 class Engram(MegatronModule):
     """DeepSeek Engram injection for one selected global transformer layer."""
 
+    # Found by async_lookup.plan_engram_lookups among a model's modules.
+    supports_async_lookup = True
+
     def __init__(
         self,
         config,
@@ -388,6 +393,10 @@ class Engram(MegatronModule):
                 f"Engram dense_impl must be one of {_DENSE_IMPLS}, got {dense_impl!r}."
             )
         self.dense_impl = dense_impl
+        # Asynchronous lookup (async_lookup): the lookup handed over for the current call, and
+        # the routes planned for the step's remaining microbatches.
+        self.prefetched_lookup: EngramLookupHandle | None = None
+        self.planned_routes: deque = deque()
 
     @property
     def local_sparse_parameter_count(self) -> int:
@@ -565,28 +574,24 @@ class Engram(MegatronModule):
             dim=0,
         )
 
-    def forward(
+    def _local_sequence_length(self, sequence_length: int) -> int:
+        """Hidden-state sequence length of this rank for a CP-local token row."""
+        tp_size = get_pg_size(self.tp_group)
+        if self.config.sequence_parallel and tp_size > 1:
+            return sequence_length // tp_size
+        return sequence_length
+
+    def _hash_ids(
         self,
-        hidden_states: Tensor,
         input_ids: Tensor,
-        packed_seq_params: PackedSeqParams | None = None,
+        row_cu_seqlens: Tensor | None,
+        local_sequence_length: int,
+        input_is_global: bool = False,
     ) -> Tensor:
-        """Return an Engram residual with the same standard or mHC layout as input.
+        """Per-table row IDs ``[batch, local_seq, tables]`` of this rank's positions.
 
-        ``packed_seq_params`` carries the packed (THD) document boundaries. It is only used to
-        stop an n-gram window from reaching back into the previous document of the same row;
-        the causal convolution deliberately still mixes across the boundary, matching both
-        published reference implementations.
+        ``input_is_global`` means ``input_ids`` already holds the whole (pre-CP-split) row.
         """
-        if hidden_states.ndim != 3:
-            raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
-        expected_hidden = self.num_streams * self.hidden_size
-        if hidden_states.shape[-1] != expected_hidden:
-            raise ValueError(
-                f"Engram expected hidden width {expected_hidden}, got {hidden_states.shape[-1]}."
-            )
-
-        row_cu_seqlens = _row_cu_seqlens(packed_seq_params)
         message = "engram.hash"
         nvtx_range_push(message)
         try:
@@ -595,7 +600,7 @@ class Engram(MegatronModule):
             # placed on another rank, so the memory is computed on the restored global
             # sequence and re-selected afterwards. input_ids is a small int64 tensor, so the
             # gather costs far less than threading a second token channel through the model.
-            if cp_size > 1:
+            if cp_size > 1 and not input_is_global:
                 global_input_ids = _gather_tokens_across_cp(
                     input_ids, self.cp_group, row_cu_seqlens
                 )
@@ -620,18 +625,127 @@ class Engram(MegatronModule):
                     hash_ids = select_zigzag(
                         hash_ids, cp_size, get_pg_rank(self.cp_group), sequence_dim=1
                     )
-            hash_ids = slice_hashes_for_sequence_parallel(
-                hash_ids, hidden_states.shape[0], self.tp_group
+            return slice_hashes_for_sequence_parallel(
+                hash_ids, local_sequence_length, self.tp_group
             )
         finally:
             nvtx_range_pop(message)
 
+    def _lookup(self, hash_ids: Tensor, route=None, group=None) -> Tensor:
+        """The ``[seq, batch, memory_dim]`` memory for ``hash_ids`` (or a planned ``route``)."""
         message = "engram.lookup"
         nvtx_range_push(message)
         try:
-            memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+            if route is not None:
+                rows = self.embedding.lookup_routed(route, group=group)
+            elif group is not None and self.embedding.ep_size > 1:
+                route = self.embedding.route(hash_ids)
+                self.embedding.exchange_route_counts([route], group=group)
+                rows = self.embedding.lookup_routed(route, group=group)
+            else:
+                rows = self.embedding(hash_ids)
+            return rows.flatten(start_dim=-2).transpose(0, 1).contiguous()
         finally:
             nvtx_range_pop(message)
+
+    def route_global_tokens(self, tokens: Tensor):
+        """Route the lookup of one microbatch from its whole (pre-CP-split) unpacked token rows.
+
+        Used by ``async_lookup.plan_engram_lookups`` to route a step's microbatches up front.
+        """
+        cp_size = get_pg_size(self.cp_group)
+        local_sequence_length = self._local_sequence_length(tokens.shape[1] // cp_size)
+        hash_ids = self._hash_ids(tokens, None, local_sequence_length, input_is_global=True)
+        return self.embedding.route(hash_ids)
+
+    def prefetch(
+        self, input_ids: Tensor, packed_seq_params: PackedSeqParams | None = None, route=None
+    ) -> EngramLookupHandle:
+        """Issue this layer's lookup for one microbatch on the lookup stream.
+
+        Returns at once; ``forward`` consumes the result when the layer runs (see
+        ``async_lookup``). With a planned ``route`` nothing synchronizes with the host;
+        without one, the counts are exchanged here, which waits for the lookup stream only.
+
+        Args:
+            input_ids: This rank's (CP-local) token IDs ``[batch, seq]``.
+            packed_seq_params: Packed (THD) document boundaries, if any.
+            route: The route ``plan_engram_lookups`` prepared for this microbatch.
+        """
+        local_sequence_length = self._local_sequence_length(input_ids.shape[1])
+        if route is not None and tuple(route.shape[:2]) != (
+            input_ids.shape[0],
+            local_sequence_length,
+        ):
+            raise RuntimeError(
+                f"Engram layer {self.layer_number}: the planned route covers "
+                f"{tuple(route.shape[:2])} positions but this microbatch has "
+                f"{(input_ids.shape[0], local_sequence_length)}; the step's microbatches were "
+                "planned in a different order or shape."
+            )
+        group = get_lookup_group(self.embedding.ep_group) if self.embedding.ep_size > 1 else None
+        row_cu_seqlens = _row_cu_seqlens(packed_seq_params)
+        compute_stream = torch.cuda.current_stream()
+        input_is_global = False
+        if route is None and get_pg_size(self.cp_group) > 1:
+            # The CP communicator belongs to the compute stream: gather there, before the fork.
+            input_ids = _gather_tokens_across_cp(input_ids, self.cp_group, row_cu_seqlens)
+            input_is_global = True
+        stream = get_lookup_stream()
+        stream.wait_stream(compute_stream)
+        message = "engram.prefetch"
+        nvtx_range_push(message)
+        try:
+            with torch.cuda.stream(stream):
+                hash_ids = None
+                if route is None:
+                    input_ids.record_stream(stream)
+                    hash_ids = self._hash_ids(
+                        input_ids, row_cu_seqlens, local_sequence_length, input_is_global
+                    )
+                memory = self._lookup(hash_ids, route=route, group=group)
+                ready = torch.cuda.Event()
+                ready.record(stream)
+        finally:
+            nvtx_range_pop(message)
+        return EngramLookupHandle(memory, ready)
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        input_ids: Tensor,
+        packed_seq_params: PackedSeqParams | None = None,
+    ) -> Tensor:
+        """Return an Engram residual with the same standard or mHC layout as input.
+
+        ``packed_seq_params`` carries the packed (THD) document boundaries. It is only used to
+        stop an n-gram window from reaching back into the previous document of the same row;
+        the causal convolution deliberately still mixes across the boundary, matching both
+        published reference implementations.
+
+        When the caller handed over a prefetched lookup (``prefetched_lookup``, see
+        ``async_lookup``), only the dense half runs here.
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
+        expected_hidden = self.num_streams * self.hidden_size
+        if hidden_states.shape[-1] != expected_hidden:
+            raise ValueError(
+                f"Engram expected hidden width {expected_hidden}, got {hidden_states.shape[-1]}."
+            )
+
+        row_cu_seqlens = _row_cu_seqlens(packed_seq_params)
+        if self.prefetched_lookup is not None:
+            memory = self.prefetched_lookup.attach()
+            if memory.shape[:2] != hidden_states.shape[:2]:
+                raise RuntimeError(
+                    f"Engram layer {self.layer_number}: the prefetched memory covers "
+                    f"{tuple(memory.shape[:2])} positions, the hidden states "
+                    f"{tuple(hidden_states.shape[:2])}."
+                )
+        else:
+            hash_ids = self._hash_ids(input_ids, row_cu_seqlens, hidden_states.shape[0])
+            memory = self._lookup(hash_ids)
         if self._use_fused_dense(hidden_states):
             return self._dense_fused(memory, hidden_states)
         return self._dense_reference(memory, hidden_states, row_cu_seqlens)

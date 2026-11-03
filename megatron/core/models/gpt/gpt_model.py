@@ -675,6 +675,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 raise ValueError("Engram does not support inference or generation.")
             if input_ids is None:
                 raise ValueError("Engram requires input token IDs on every pipeline stage.")
+            if getattr(self.config, "engram_async_lookup", False):
+                raise ValueError("engram_async_lookup is implemented for HybridModel only.")
         if (
             self.config.moe_n_hash_layers > 0 or self.config.engram_enabled
         ) and input_ids is not None:

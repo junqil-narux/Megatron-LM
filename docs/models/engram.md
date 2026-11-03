@@ -173,6 +173,33 @@ single quiet row shard with zero hash hits in one step is reported but is not an
 is rejected together with the distributed optimizer, whose reduce-scattered gradient buffer does
 not expose full per-parameter gradients. Normal training does not compute these diagnostics.
 
+### Asynchronous lookup (`--engram-async-lookup`, hybrid models)
+
+The memory depends only on the token IDs; only the dense half reads the hidden states. With
+`--engram-async-lookup` the lookup leaves the Engram layer
+(`megatron/core/models/engram/async_lookup.py`):
+
+1. At the start of each training step, every microbatch's tokens (drained before the schedule,
+   also when PP = TP = 1) are hashed and routed, and all their per-(owner, table) counts go
+   through one all-to-all and one host transfer: one host synchronization per step instead of
+   one per microbatch and Engram layer. Packed (`--sft`) rows need `cu_seqlens`, which only
+   `get_batch` produces, so they still exchange their counts per microbatch.
+2. `HybridModel.forward` issues each local Engram layer's request all-to-all, owner gather and
+   return all-to-all before the embedding, on a dedicated high-priority CUDA stream and a
+   dedicated communicator over the EP ranks (NCCL serializes operations on one communicator, and
+   the MoE all-to-alls run on the compute stream). The Engram layer waits on an event and runs
+   only its dense half. Under full recompute the prefetched memory stays bound to its
+   microbatch's checkpoint, so the recompute does not repeat the lookup.
+3. A handoff node created at the Engram layer launches the lookup's backward (return all-to-all,
+   embedding backward, gradient accumulation) on the lookup stream as soon as the layer's backward
+   produced the memory's gradient, so it overlaps the backward of the layers in front. DDP
+   creates the table gradient accumulators on the lookup stream (`grad_accumulation_stream`), and
+   the compute stream joins the lookup stream when backward reaches the embedding output.
+
+Outputs and gradients are bitwise identical to the inline lookup
+(`tests/unit_tests/models/engram/test_async_lookup.py`). The Engram layers must be on the first
+pipeline stage (and the first virtual stage).
+
 ## TP, SP, and PP data flow
 
 TP does not shard Engram tables or dense Engram projections. Engram requires
@@ -269,5 +296,6 @@ read gate), EP, TP, PP, SP, MoE coexistence,
 multi-token prediction (MTP layers never build Engram), native all-to-all, torch distributed
 checkpoints, and packed THD rows (document boundaries from EOS, from `cu_seqlens`, or both).
 CP combined with packed rows, CUDA graphs, FSDP, inference serving,
-offload, DeepEP, communication overlap, request deduplication, FP8 table storage, and fused
-Engram kernels are intentionally deferred and rejected during startup.
+offload, DeepEP, communication overlap (other than the asynchronous lookup above), request
+deduplication, FP8 table storage, and fused Engram kernels are intentionally deferred and rejected
+during startup.
