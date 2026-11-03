@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from contextlib import nullcontext
-from typing import List, Optional, Set, Tuple, Union
+from contextlib import AbstractContextManager, nullcontext
+from typing import Callable, List, Optional, Set, Tuple, Union
 
 from torch import Tensor
 
@@ -32,6 +32,7 @@ def checkpointed_forward(
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     input_ids: Optional[Tensor] = None,
+    layer_context: Optional[Callable[[MegatronModule], AbstractContextManager]] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -42,6 +43,8 @@ def checkpointed_forward(
         layer_offset (int): The global layer offset for the current
             pipeline stage. Used to convert local layer indices to
             global indices when checking extract_layer_indices.
+        layer_context (Callable, optional): Returns a context manager entered around each
+            layer's call, in the forward and again in the recompute.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -108,7 +111,10 @@ def checkpointed_forward(
                     padding_mask=padding_mask,
                     input_ids=input_ids,
                 )
-                with inner_quantization_context:
+                with (
+                    inner_quantization_context,
+                    layer_context(layer) if layer_context is not None else nullcontext(),
+                ):
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
                     elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
