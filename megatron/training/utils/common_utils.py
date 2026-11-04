@@ -144,6 +144,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                 data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
                 if data is None:
                     continue
+                if getattr(param, 'optimizer_sharding_group', None) is not None:
+                    # Sharded over its own single-rank group (Engram tables over EP x
+                    # expert-DP): the model shard itself differs across expert-DP peers, so it
+                    # needs the expert-DP sum whether or not the main param is sharded.
+                    assert param.optimizer_sharding_group.size() == 1 and not is_gtp
+                    is_sharded = True
                 if is_gtp:
                     (moe_gtp_sharded_params_data if is_sharded else moe_gtp_params_data).append(
                         data

@@ -290,7 +290,25 @@ class DistributedDataParallel(_BaseDataParallel):
         self.expert_parallel_buffers = []
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
         for buffer_key, (params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            if buffer_key.optimizer_sharding_group is not None:
+                # Every data-parallel contribution already reached this rank's shard (the
+                # Engram lookup's backward all-to-all delivers them), so the gradient still
+                # needs the same 1/dp_cp scaling as any other gradient, and the collective over
+                # the sharding group only sums or averages true replicas.
+                assert (
+                    buffer_key.is_expert_parallel
+                ), "optimizer_sharding_group is only supported for allreduce=False parameters."
+                assert (
+                    self.ddp_config.num_distributed_optimizer_instances == 1
+                ), "optimizer_sharding_group does not support partial distributed optimizers."
+                data_parallel_group = buffer_key.optimizer_sharding_group
+                if config.calculate_per_token_loss:
+                    scaling_factor = 1.0
+                elif self.ddp_config.average_in_collective:
+                    scaling_factor = data_parallel_group.size() / self.dp_cp_group.size()
+                else:
+                    scaling_factor = 1.0 / self.dp_cp_group.size()
+            elif buffer_key.is_expert_parallel:
                 data_parallel_group = self.intra_expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
@@ -354,13 +372,21 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.reduce_scatter_with_fp32_accumulation
             ),
         )
-        self.expert_parallel_bucket_groups = partition_buckets(
-            self.expert_parallel_buffers,
-            force_single_bucket_group=disable_bucketing,
-            reduce_scatter_with_fp32_accumulation=(
-                self.ddp_config.reduce_scatter_with_fp32_accumulation
-            ),
-        )
+        # A bucket group runs one collective over one group, so buffers reduced over different
+        # groups must never share a bucket group (partition_buckets may merge fp8 and bf16
+        # buckets): partition the expert buffers per reduction group.
+        expert_buffers_by_group = {}
+        for buffer in self.expert_parallel_buffers:
+            expert_buffers_by_group.setdefault(buffer.data_parallel_group, []).append(buffer)
+        self.expert_parallel_bucket_groups = []
+        for buffers_in_group in expert_buffers_by_group.values():
+            self.expert_parallel_bucket_groups += partition_buckets(
+                buffers_in_group,
+                force_single_bucket_group=disable_bucketing,
+                reduce_scatter_with_fp32_accumulation=(
+                    self.ddp_config.reduce_scatter_with_fp32_accumulation
+                ),
+            )
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             assert (
@@ -717,8 +743,12 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for param in self.module.parameters():
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            sharding_group = getattr(param, 'optimizer_sharding_group', None)
 
-            if is_expert_parallel:
+            if sharding_group is not None:
+                # Only the sharding group holds replicas of this shard.
+                data_parallel_group = sharding_group
+            elif is_expert_parallel:
                 data_parallel_group = self.expt_dp_group
             else:
                 data_parallel_group = self.dp_cp_group

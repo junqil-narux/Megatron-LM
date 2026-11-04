@@ -4576,6 +4576,7 @@ def _report_engram_memory_state(model, optimizer, phase):
         "phase": phase,
         "global_rank": rank,
         "world_size": torch.distributed.get_world_size(),
+        "table_sharding": getattr(args, "engram_table_sharding", "ep"),
         "topology": topology,
         "cuda_memory": cuda_memory,
         "totals": totals,
@@ -4585,7 +4586,8 @@ def _report_engram_memory_state(model, optimizer, phase):
         output.write(json.dumps(report, sort_keys=True) + "\n")
     print(
         "[Engram memory] "
-        f"rank={rank} phase={phase} ep_size={topology['ep']['size']} "
+        f"rank={rank} phase={phase} table_sharding={report['table_sharding']} "
+        f"ep_size={topology['ep']['size']} "
         f"expert_dp_size={topology['expt_dp']['size']} "
         f"model_bytes={totals['model_bytes']} main_bytes={totals['main_bytes']} "
         f"optimizer_state_bytes={sum(totals['optimizer_state_bytes'].values())} "

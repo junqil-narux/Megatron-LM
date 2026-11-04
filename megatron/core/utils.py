@@ -1097,6 +1097,14 @@ def check_param_hashes_across_dp_replicas(
     local_non_expert_param_hashes, local_expert_param_hashes = [], []
     for model_chunk_id, model_chunk in enumerate(model):
         for param_name, param in model_chunk.named_parameters():
+            sharding_group = getattr(param, "optimizer_sharding_group", None)
+            if sharding_group is not None:
+                # Parameters sharded over their own group (e.g. Engram tables over EP x
+                # expert-DP) are distinct across the expert-DP peers this check compares.
+                assert (
+                    sharding_group.size() == 1
+                ), "Hash checks across a multi-rank optimizer_sharding_group are not supported."
+                continue
             param_hash = torch.frombuffer(
                 array.array(
                     "B", hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()

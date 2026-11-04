@@ -5380,6 +5380,22 @@ def _add_engram_args(parser):
     group.add_argument('--engram-embedding-lr-multiplier', type=float, default=5.0)
     group.add_argument('--engram-embedding-weight-decay', type=float, default=0.0)
     group.add_argument(
+        '--engram-table-sharding',
+        choices=['ep', 'ep_edp'],
+        default='ep',
+        help='Process group the Engram table rows are sharded over. "ep" (default) shards rows '
+        'over the MoE expert-parallel group and replicates them over expert-DP; "ep_edp" '
+        'shards rows over EP x expert-DP within the pipeline stage, so each row has one owner '
+        'and the table needs no data-parallel gradient reduction. "ep_edp" requires '
+        '--use-distributed-optimizer, CP=1 and PP=1.',
+    )
+    group.add_argument(
+        '--engram-table-init-like-ep',
+        action='store_true',
+        help='With --engram-table-sharding ep_edp, initialize the tables exactly as the "ep" '
+        'layout does (for A/B runs between the two layouts).',
+    )
+    group.add_argument(
         '--engram-verify-training',
         action='store_true',
         help='Synchronously verify and log sparse-table gradients and updates each step.',

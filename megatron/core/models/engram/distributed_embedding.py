@@ -113,6 +113,24 @@ def get_contiguous_row_range(global_rows: int, rank: int, world_size: int) -> tu
     return start, start + local_rows
 
 
+def initialize_row_shard(
+    shard: Tensor, init_method: Callable[[Tensor], None], global_num_embeddings: int, rank: int
+) -> None:
+    """Draw ``shard`` on a forked RNG stream keyed by (table size, shard rank)."""
+    base_seed = torch.initial_seed() % (2**31)
+    shard_seed = base_seed + 100003 * global_num_embeddings + rank
+    devices = [shard.device] if shard.device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        if devices:
+            torch.cuda.manual_seed(shard_seed)
+        else:
+            # Seed only the CPU generator: torch.manual_seed would also reseed every CUDA
+            # default generator with the EP-rank-dependent shard seed, and fork_rng([])
+            # restores only the CPU state.
+            torch.default_generator.manual_seed(shard_seed)
+        init_method(shard)
+
+
 class EPShardedEmbeddingTable(MegatronModule):
     """One prime-sized embedding table sharded over an explicit EP group."""
 
@@ -168,18 +186,7 @@ class EPShardedEmbeddingTable(MegatronModule):
         unique prime table size and the EP rank, so TP and expert-DP replicas stay identical
         while EP shards are decorrelated.
         """
-        base_seed = torch.initial_seed() % (2**31)
-        shard_seed = base_seed + 100003 * self.global_num_embeddings + self.ep_rank
-        devices = [self.weight.device] if self.weight.device.type == "cuda" else []
-        with torch.random.fork_rng(devices=devices):
-            if devices:
-                torch.cuda.manual_seed(shard_seed)
-            else:
-                # Seed only the CPU generator: torch.manual_seed would also reseed every CUDA
-                # default generator with the EP-rank-dependent shard seed, and fork_rng([])
-                # restores only the CPU state.
-                torch.default_generator.manual_seed(shard_seed)
-            init_method(self.weight)
+        initialize_row_shard(self.weight, init_method, self.global_num_embeddings, self.ep_rank)
 
     @property
     def local_num_embeddings(self) -> int:

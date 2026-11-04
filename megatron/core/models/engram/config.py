@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from .table_groups import ENGRAM_TABLE_SHARDINGS
 from .variants import DEEPSEEK_VARIANT_NAME, EngramVariant, resolve_variant
 
 TOKENIZER_MAP_FORMAT = "megatron-engram-token-map"
@@ -226,6 +227,18 @@ class EngramConfig:
     """
     embedding_lr_multiplier: float = 5.0
     embedding_weight_decay: float = 0.0
+    table_sharding: str = "ep"
+    """Process group the table rows are sharded over (see ``table_groups.py``).
+
+    ``"ep"`` shards rows over the MoE EP group and replicates them over expert-DP;
+    ``"ep_edp"`` shards rows over EP x expert-DP so every row has a single owner.
+    """
+    table_init_like_ep: bool = False
+    """With ``table_sharding="ep_edp"``, initialize the table exactly as the ``"ep"`` layout does.
+
+    Only for A/B comparisons between the two layouts; each layout's own initialization is
+    equally valid.
+    """
     dense_impl: str = "fused"
     """Implementation of the dense half (gate, conv-norm, short convolution).
 
@@ -288,6 +301,20 @@ class EngramConfig:
             unigram_vocab_size=getattr(args, "engram_unigram_vocab_size", None),
             embedding_lr_multiplier=args.engram_embedding_lr_multiplier,
             embedding_weight_decay=args.engram_embedding_weight_decay,
+            table_sharding=getattr(args, "engram_table_sharding", "ep"),
+            table_init_like_ep=getattr(args, "engram_table_init_like_ep", False),
+        )
+        config.validate_table_sharding(
+            transformer_config,
+            # Emerging optimizers (Muon) turn --use-distributed-optimizer into the layer-wise
+            # optimizer, whose non-Muon groups (the tables) get a DistributedOptimizer sibling.
+            use_distributed_optimizer=bool(
+                getattr(args, "use_distributed_optimizer", False)
+                or getattr(args, "use_layer_wise_distributed_optimizer", False)
+            ),
+            num_distributed_optimizer_instances=getattr(
+                args, "num_distributed_optimizer_instances", 1
+            ),
         )
         packed_sequences = _validate_packed_sequence_args(args)
         config.validate_startup(
@@ -368,6 +395,13 @@ class EngramConfig:
             raise ValueError(f"{self.variant_spec.boundary_token_flag} must be nonnegative.")
         if self.embedding_lr_multiplier <= 0:
             raise ValueError("engram_embedding_lr_multiplier must be positive.")
+        if self.table_sharding not in ENGRAM_TABLE_SHARDINGS:
+            raise ValueError(
+                f"engram_table_sharding must be one of {ENGRAM_TABLE_SHARDINGS}, "
+                f"got {self.table_sharding!r}."
+            )
+        if self.table_init_like_ep and self.table_sharding != "ep_edp":
+            raise ValueError("engram_table_init_like_ep requires engram_table_sharding='ep_edp'.")
         if self.embedding_weight_decay < 0:
             raise ValueError("engram_embedding_weight_decay must be nonnegative.")
         if self.variant_spec.uses_tokenizer_artifact:
@@ -497,6 +531,43 @@ class EngramConfig:
         self._validate_parallelism(transformer_config, sequence_length)
         self._validate_packed_sequences(transformer_config, packed_sequences)
         self._validate_unsupported_features(transformer_config, use_fsdp)
+
+    def validate_table_sharding(
+        self,
+        transformer_config: Any,
+        use_distributed_optimizer: bool,
+        num_distributed_optimizer_instances: int = 1,
+    ) -> None:
+        """Reject the combinations the EP x expert-DP table layout does not handle yet.
+
+        With ``"ep_edp"`` the owner of a row receives every data-parallel gradient of that row
+        through the lookup's backward all-to-all, and its own DistributedOptimizer over a
+        single-rank replica group keeps the whole shard's state. That reasoning holds for one
+        pipeline stage and no context parallelism; the other layouts would compute wrong
+        gradients or norms silently, so they fail here instead.
+        """
+        if self.table_sharding == "ep":
+            return
+        unsupported = {
+            "context_parallel_size > 1": transformer_config.context_parallel_size > 1,
+            "pipeline_model_parallel_size > 1": (
+                transformer_config.pipeline_model_parallel_size > 1
+            ),
+            "gtp_weight_remat_size > 1": getattr(transformer_config, "gtp_weight_remat_size", 1)
+            > 1,
+            "expert_gtp_weight_remat_size > 1": getattr(
+                transformer_config, "expert_gtp_weight_remat_size", 1
+            )
+            > 1,
+            "num_distributed_optimizer_instances > 1": num_distributed_optimizer_instances > 1,
+            "running without --use-distributed-optimizer": not use_distributed_optimizer,
+        }
+        rejected = [name for name, hit in unsupported.items() if hit]
+        if rejected:
+            raise ValueError(
+                f"engram_table_sharding={self.table_sharding!r} does not support "
+                f"{', '.join(rejected)} yet."
+            )
 
     def _validate_layer_placement(self, transformer_config: Any) -> None:
         if any(layer_id > transformer_config.num_layers for layer_id in self.layer_ids):

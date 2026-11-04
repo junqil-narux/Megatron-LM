@@ -58,12 +58,17 @@ class BufferKey:
             managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
             so each whole param lives in one shard). Non-LayerWise params get
             :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+        optimizer_sharding_group: The parameters' own gradient-reduction and optimizer
+            sharding group (``param.optimizer_sharding_group``), for parameters whose
+            replicas are not the dense or expert data-parallel peers (e.g. Engram tables
+            sharded over EP x expert-DP). None for every other buffer.
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
     is_managed_by_layer_wise_optimizer: bool = False
+    optimizer_sharding_group: Optional[torch.distributed.ProcessGroup] = None
 
 
 @dataclass
