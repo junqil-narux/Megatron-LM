@@ -110,6 +110,16 @@ def get_engram_table_groups(
             )
             if other_rank == rank:
                 replica_group = group
+        # Set up both communicators now, on every rank together, instead of lazily in the
+        # first lookup (table group) or the first gradient sync (single-rank replica group).
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if str(backend) == "nccl"
+            else torch.device("cpu")
+        )
+        probe = torch.zeros(1, device=device)
+        torch.distributed.all_reduce(probe, group=table_group)
+        torch.distributed.all_reduce(probe, group=replica_group)
         groups = EngramTableGroups(
             table=table_group, replica=replica_group, optimizer_sharding_group=replica_group
         )
