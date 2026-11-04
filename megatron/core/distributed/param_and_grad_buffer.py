@@ -972,6 +972,9 @@ def group_params_for_buffers(
       which requires a separate buffer for the expert data-parallel group. This is true for experts
       when expert-parallelism > 1, expert-tensor-parallelism != tensor-parallelism, or expert-GTP
       != GTP.
+    - is_managed_by_layer_wise_optimizer / optimizer_sharding_group: see BufferKey. Parameters
+      tagged with their own ``optimizer_sharding_group`` get a buffer of their own that is reduced
+      and sharded over that group.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -1003,6 +1006,7 @@ def group_params_for_buffers(
         is_managed_by_layer_wise_optimizer = getattr(
             param, 'is_managed_by_layer_wise_optimizer', False
         )
+        optimizer_sharding_group = getattr(param, 'optimizer_sharding_group', None)
 
         # Decouple layout only: key fp8 Muon grads by their bf16 logical dtype so fp8 + bf16 grads
         # share ONE fp32 all_reduce buffer; a split uint8/bf16 reduction diverges ~1 ULP from OFF.
@@ -1014,7 +1018,11 @@ def group_params_for_buffers(
             param_dtype = param.dtype
 
         key = BufferKey(
-            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param_dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            optimizer_sharding_group,
         )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
@@ -1023,7 +1031,11 @@ def group_params_for_buffers(
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
         offset_key = BufferKey(
-            param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param.dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            optimizer_sharding_group,
         )
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1

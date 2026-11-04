@@ -640,7 +640,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            if buffer_key.optimizer_sharding_group is not None:
+                # DDP reduces and shards this buffer over the parameters' own group.
+                dp_world_size = buffer_key.optimizer_sharding_group.size()
+            elif buffer_key.is_expert_parallel:
                 dp_world_size = (
                     expert_data_parallel_world_size
                     if expert_data_parallel_world_size is not None

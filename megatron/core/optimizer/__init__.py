@@ -358,7 +358,7 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel) to params.
+    # Map (pg_overrides, is_expert_parallel, has_optimizer_sharding_group) to params.
     params_map = {}
 
     for model_chunk in model_chunks:
@@ -382,12 +382,17 @@ def _get_param_groups(
                 param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            # Parameters reduced and sharded over their own group (e.g. Engram tables sharded
+            # over EP x expert-DP) need their own optimizer instance, hence their own groups.
+            has_optimizer_sharding_group = (
+                getattr(param, 'optimizer_sharding_group', None) is not None
+            )
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel)
+            key = (param_override_tuple, is_expert_parallel, has_optimizer_sharding_group)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -406,7 +411,7 @@ def _get_param_groups(
     param_groups = []
     # Sort keys, None first.
     for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
-        param_override_tuple, is_expert_parallel = key
+        param_override_tuple, is_expert_parallel, has_optimizer_sharding_group = key
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -439,6 +444,7 @@ def _get_param_groups(
         param_group = {
             'params': params,
             'is_expert_parallel': is_expert_parallel,
+            'has_optimizer_sharding_group': has_optimizer_sharding_group,
             'default_config': uses_default_lr_schedule,
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
@@ -481,6 +487,88 @@ def _get_param_groups_and_buffers(
             buffers[model_chunk_idx + model_chunk_offset] = getattr(model_chunk, buffer_name)
 
     return param_groups, buffers
+
+
+def _buffer_has_optimizer_sharding_group(buffer: _ParamAndGradBuffer) -> bool:
+    """Whether DDP reduces this buffer over its parameters' own ``optimizer_sharding_group``."""
+    return bool(buffer.params) and (
+        getattr(buffer.params[0], 'optimizer_sharding_group', None) is not None
+    )
+
+
+def _split_buffers_by_optimizer_sharding_group(
+    per_model_buffers: Dict[int, List[_ParamAndGradBuffer]],
+) -> Tuple[Dict[int, List[_ParamAndGradBuffer]], Dict[int, List[_ParamAndGradBuffer]]]:
+    """Split per-chunk buffers into (default-group buffers, sharding-group buffers)."""
+    default_buffers, sharding_group_buffers = {}, {}
+    for model_chunk_idx, buffers in per_model_buffers.items():
+        default = [b for b in buffers if not _buffer_has_optimizer_sharding_group(b)]
+        sharded = [b for b in buffers if _buffer_has_optimizer_sharding_group(b)]
+        # Without sharding-group buffers the default split is the input, unchanged.
+        if default or not sharded:
+            default_buffers[model_chunk_idx] = default
+        if sharded:
+            sharding_group_buffers[model_chunk_idx] = sharded
+    return default_buffers, sharding_group_buffers
+
+
+def _get_optimizer_sharding_group(param_groups: List[Dict]) -> torch.distributed.ProcessGroup:
+    """The one ``optimizer_sharding_group`` shared by the parameters of ``param_groups``."""
+    groups = {
+        id(param.optimizer_sharding_group): param.optimizer_sharding_group
+        for group in param_groups
+        for param in group['params']
+    }
+    # Every rank of the stage owns a shard (the table layout requires PP=1), so a rank without
+    # one would build a different optimizer chain and desynchronize the gradient-norm reduction.
+    assert len(groups) == 1, (
+        f"Expected the parameters of a sharding-group optimizer to share exactly one "
+        f"optimizer_sharding_group on every rank, found {len(groups)}."
+    )
+    return next(iter(groups.values()))
+
+
+def _get_sharding_group_optimizer(
+    config: OptimizerConfig,
+    chained_config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    param_groups: List[Dict],
+    per_model_buffers: Dict[int, List[_ParamAndGradBuffer]],
+    model_parallel_group: torch.distributed.ProcessGroup,
+    intra_dist_opt_group: torch.distributed.ProcessGroup,
+    pg_collection: Optional[ProcessGroupCollection],
+) -> MegatronOptimizer:
+    """DistributedOptimizer over the parameters' own ``optimizer_sharding_group``.
+
+    For Engram tables sharded over EP x expert-DP the group holds only this rank, so the whole
+    shard's main parameters and Adam states stay on its owner. Gradient statistics still reduce
+    over ``intra_dist_opt_group`` like every other DistributedOptimizer: shards are disjoint across
+    that group (TP duplicates are filtered), so each table row enters the norm exactly once.
+    """
+    assert (
+        per_model_buffers
+    ), "Parameters with an optimizer_sharding_group need the DDP buffer reduced over that group."
+    sharding_config = copy.copy(config)
+    sharding_config.use_distributed_optimizer = True
+    optimizer = _get_megatron_optimizer_based_on_param_groups(
+        config=sharding_config,
+        model_chunks=model_chunks,
+        param_groups=param_groups,
+        per_model_buffers=per_model_buffers,
+        model_parallel_group=model_parallel_group,
+        data_parallel_group=_get_optimizer_sharding_group(param_groups),
+        data_parallel_group_gloo=None,
+        # Checkpoint keys of the dp_reshardable format are per data-parallel group; every rank
+        # leads its own single-rank group, so the global rank keeps them distinct.
+        data_parallel_group_idx=torch.distributed.get_rank(),
+        intra_dist_opt_group=intra_dist_opt_group,
+        distributed_optimizer_instance_id=0,
+        pg_collection=pg_collection,
+    )
+    # ChainedOptimizer asserts that its sub-optimizers share one config.
+    if hasattr(optimizer, 'config'):
+        optimizer.config = chained_config
+    return optimizer
 
 
 def _get_megatron_optimizer_based_on_param_groups(
@@ -928,6 +1016,7 @@ def _get_megatron_emerging_optimizer(
     distopt_process_groups = None
     distopt_per_model_buffers = None
     distopt_per_model_expert_buffers = None
+    distopt_per_model_sharding_group_buffers = None
     use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
     if use_separate_distributed_optimizer:
         ddp_config = model_chunks[0].ddp_config
@@ -977,6 +1066,9 @@ def _get_megatron_emerging_optimizer(
                 ]
                 if non_layer_wise_buffers:
                     dest[model_chunk_idx] = non_layer_wise_buffers
+        distopt_per_model_expert_buffers, distopt_per_model_sharding_group_buffers = (
+            _split_buffers_by_optimizer_sharding_group(distopt_per_model_expert_buffers)
+        )
 
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
@@ -1042,7 +1134,11 @@ def _get_megatron_emerging_optimizer(
                         distopt_process_groups['intra_dp_cp_group_gloo'],
                     ),
                     (
-                        [g for g in groups if g['is_expert_parallel']],
+                        [
+                            g
+                            for g in groups
+                            if g['is_expert_parallel'] and not g['has_optimizer_sharding_group']
+                        ],
                         distopt_per_model_expert_buffers,
                         distopt_process_groups['expt_tp_pp_group'],
                         distopt_process_groups['intra_expt_dp_group'],
@@ -1078,7 +1174,29 @@ def _get_megatron_emerging_optimizer(
                     if hasattr(result, 'config'):
                         result.config = config
                     results.append(result)
+                sharding_group_param_groups = [
+                    g for g in groups if g['has_optimizer_sharding_group']
+                ]
+                if sharding_group_param_groups:
+                    # Engram tables sharded over EP x expert-DP: one more DistributedOptimizer,
+                    # over the tables' single-rank replica group.
+                    results.append(
+                        _get_sharding_group_optimizer(
+                            config=fallback_config,
+                            chained_config=config,
+                            model_chunks=model_chunks,
+                            param_groups=sharding_group_param_groups,
+                            per_model_buffers=distopt_per_model_sharding_group_buffers,
+                            model_parallel_group=distopt_process_groups['expt_tp_pp_group'],
+                            intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
+                            pg_collection=pg_collection,
+                        )
+                    )
             else:
+                assert not any(g['has_optimizer_sharding_group'] for g in groups), (
+                    "Parameters with an optimizer_sharding_group (e.g. --engram-table-sharding "
+                    "ep_edp) require --use-distributed-optimizer."
+                )
                 # Legacy ping-pong layer-wise path (use_layer_wise=True) or the
                 # non-layer-wise standard chain: keep ``use_distributed_optimizer``
                 # off; in layer-wise mode the raw torch optimizer (returned as a
@@ -1388,9 +1506,18 @@ def get_megatron_optimizer(
         model_chunk_offset=0,
         config=config,
         config_overrides=config_overrides,
-        filter_fn=lambda g: g['is_expert_parallel'],
+        filter_fn=lambda g: g['is_expert_parallel'] and not g['has_optimizer_sharding_group'],
         buffer_name='expert_parallel_buffers',
     )
+    sharding_group_param_groups, _ = _get_param_groups_and_buffers(
+        model_chunks,
+        model_chunk_offset=0,
+        config=config,
+        config_overrides=config_overrides,
+        filter_fn=lambda g: g['has_optimizer_sharding_group'],
+        buffer_name='expert_parallel_buffers',
+    )
+    moe_buffers, sharding_group_buffers = _split_buffers_by_optimizer_sharding_group(moe_buffers)
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
             for param in param_group["params"]:
@@ -1417,6 +1544,30 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
+            )
+        )
+
+    if sharding_group_param_groups:
+        assert config.use_distributed_optimizer, (
+            "Parameters with an optimizer_sharding_group (e.g. --engram-table-sharding ep_edp) "
+            "require --use-distributed-optimizer."
+        )
+        if dump_param_to_param_group_map is not None:
+            for param_group in sharding_group_param_groups:
+                for param in param_group["params"]:
+                    param_name = get_global_unique_param_name(model_chunks, param)
+                    param_to_param_group[param_name] = param_group_id
+                param_group_id += 1
+        optimizers.append(
+            _get_sharding_group_optimizer(
+                config=config,
+                chained_config=config,
+                model_chunks=model_chunks,
+                param_groups=sharding_group_param_groups,
+                per_model_buffers=sharding_group_buffers,
+                model_parallel_group=expt_tp_pp_with_egtp_remat_group,
+                intra_dist_opt_group=intra_dist_opt_group,
                 pg_collection=pg_collection,
             )
         )

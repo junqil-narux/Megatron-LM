@@ -34,6 +34,11 @@ from .cp_layout import (
 from .distributed_embedding import EPShardedMultiTableEmbedding
 from .fused_dense import HAVE_TRITON, channel_block, fused_engram_dense
 from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
+from .table_groups import (
+    get_engram_table_groups,
+    initialize_like_ep_layout,
+    tag_engram_table_parameters,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -331,15 +336,23 @@ class Engram(MegatronModule):
             persistent=False,
         )
 
+        table_groups = get_engram_table_groups(
+            engram_config.table_sharding, pg_collection.ep, pg_collection.expt_dp
+        )
         self.embedding = EPShardedMultiTableEmbedding(
             config=config,
             table_sizes=table_sizes,
             embedding_dim=engram_config.head_dim,
             init_method=config.init_method,
-            ep_group=pg_collection.ep,
+            ep_group=table_groups.table,
             tp_group=pg_collection.tp,
-            expt_dp_group=pg_collection.expt_dp,
+            expt_dp_group=table_groups.replica,
         )
+        tag_engram_table_parameters(self.embedding, table_groups)
+        if engram_config.table_init_like_ep and config.perform_initialization:
+            initialize_like_ep_layout(
+                self.embedding, get_pg_size(pg_collection.ep), config.init_method
+            )
         factory_kwargs = {"device": device, "dtype": config.params_dtype}
         # Official Qwen PLE layout: one fused key projection over all residual streams, one
         # shared value projection, and one group RMSNorm per role. This is mathematically
