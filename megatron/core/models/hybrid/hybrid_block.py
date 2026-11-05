@@ -9,6 +9,7 @@ import copy
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -22,6 +23,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.engram.async_lookup import use_prefetched_lookup
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1426,6 +1428,7 @@ class HybridStack(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
         input_ids: Optional[Tensor] = None,
+        engram_lookups: Optional[dict] = None,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
         Forward function of the HybridStack class.
@@ -1441,6 +1444,8 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
+            engram_lookups (dict, optional): Prefetched Engram lookups keyed by layer number
+                (``--engram-async-lookup``); each is handed to its layer's Engram module.
         Returns:
             Tensor in the common case. A 2-tuple ``(hidden_states, mhc_multistream)`` ONLY when
             ``enable_hyper_connections and post_process and mtp_num_layers > 0 and not
@@ -1540,6 +1545,13 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     input_ids=input_ids,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                    # Bound to this microbatch's lookups: the recompute in backward reuses them
+                    # instead of repeating the lookup.
+                    layer_context=(
+                        partial(use_prefetched_lookup, lookups=engram_lookups)
+                        if engram_lookups
+                        else None
+                    ),
                 )
             else:
                 grouped_tail_to_skip = None
@@ -1565,7 +1577,7 @@ class HybridStack(MegatronModule):
                         f"hybrid.layer{layer.layer_number:02d}.{self.layer_type_list[l_no]}"
                     )
                     nvtx_range_push(layer_range)
-                    with inner_quant_context:
+                    with inner_quant_context, use_prefetched_lookup(layer, engram_lookups):
                         if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                             layer_kwargs = dict(
                                 hidden_states=hidden_states,

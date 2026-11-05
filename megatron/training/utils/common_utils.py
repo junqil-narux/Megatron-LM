@@ -643,6 +643,13 @@ class PipelineTokenPrefetchIterator:
         self._last_batch = batch
         return batch
 
+    def peek_pipeline_tokens(self) -> list[torch.Tensor]:
+        """The tokens of the microbatches still to be scheduled, in order, without consuming them.
+
+        Empty on the lazy path (``token_spec``), which prepares no tokens ahead.
+        """
+        return list(self._pipeline_tokens)
+
     def pop_pipeline_tokens(self) -> torch.Tensor:
         """Return the tokens prepared for the next scheduled microbatch.
 
@@ -670,6 +677,7 @@ def prepare_tokens_for_pipeline(
     sequence_length: int,
     pp_group,
     tp_group,
+    prefetch_all: bool = False,
 ) -> PipelineTokenPrefetchIterator:
     """Distribute every Engram microbatch's tokens before pipeline scheduling starts.
 
@@ -680,6 +688,10 @@ def prepare_tokens_for_pipeline(
     tensor to its TP peers; each TP coordinate then broadcasts to the matching PP group. Data
     availability is broadcast first so an exhausted iterator fails on every rank instead of
     hanging the peers inside the token broadcast.
+
+    ``prefetch_all`` drains the step's microbatches up front even when a single rank holds the
+    whole schedule, so their tokens are available before the schedule (the asynchronous Engram
+    lookup routes them all at once).
     """
     # Under VPP the scheduler hands each model chunk its own iterator and indexes the list
     # itself before calling forward_step, so every chunk ends up with its own wrapper and no
@@ -713,7 +725,7 @@ def prepare_tokens_for_pipeline(
     source_failure = None
     source_exception = None
 
-    if pp_size == 1 and tp_size == 1:
+    if pp_size == 1 and tp_size == 1 and not prefetch_all:
         # Nothing to distribute: draining the schedule's whole global batch up front would
         # only hold every microbatch resident for no benefit.
         return _wrap([], [], token_spec=(micro_batch_size, sequence_length, device))

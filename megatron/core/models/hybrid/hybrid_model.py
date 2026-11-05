@@ -39,6 +39,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
+    get_pg_size,
     is_using_quantization_scales,
     log_single_rank,
     nvtx_range_pop,
@@ -378,6 +379,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             name="decoder",
         )
 
+        self._engram_modules = []
+        if getattr(self.config, "engram_async_lookup", False):
+            self._setup_engram_async_lookup()
+
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
             hybrid_submodules = hybrid_stack_spec.submodules
@@ -510,6 +515,35 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
             self.cudagraph_manager = CudaGraphManager(config)
 
+    def _setup_engram_async_lookup(self) -> None:
+        """Create the asynchronous Engram lookup's communicator and find the local Engram layers.
+
+        Every rank builds its HybridModel chunks, so the (collective) communicator creation
+        happens here rather than in the Engram layers, which exist only on some stages.
+        """
+        from megatron.core.models.engram.async_lookup import (
+            create_lookup_groups,
+            get_lookup_stream,
+            local_engram_modules,
+        )
+
+        if get_pg_size(self.pg_collection.ep) > 1:
+            create_lookup_groups(self.pg_collection.ep)
+        self._engram_modules = local_engram_modules(self.decoder.layers)
+        for engram in self._engram_modules:
+            for table in engram.embedding.tables:
+                # The table gradients are produced on the lookup stream; DDP creates their
+                # accumulators there too, so accumulating them does not stall the compute
+                # stream on the lookup's backward.
+                table.weight.grad_accumulation_stream = get_lookup_stream()
+        if self._engram_modules and not self.pre_process:
+            raise ValueError(
+                "engram_async_lookup issues the Engram lookups before the embedding, so the "
+                "Engram layers must be on the first pipeline stage (and the first virtual "
+                f"stage); layers {[engram.layer_number for engram in self._engram_modules]} "
+                "are not."
+            )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -551,6 +585,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # along the sequence like its hidden states; the post-process keeps the caller's full-length
         # mask (the MTP rolls it alongside input_ids / position_ids, and MoE layers re-align it to
         # their hidden states themselves).
+        # Asynchronous Engram lookups: issue them before the embedding so they overlap it and the
+        # layers in front of the Engram layers (megatron/core/models/engram/async_lookup.py).
+        engram_lookups = None
+        if (
+            self._engram_modules
+            and self.training
+            and decoder_input is None
+            and input_ids is not None
+            and inference_context is None
+        ):
+            from megatron.core.models.engram.async_lookup import prefetch_engram_lookups
+
+            engram_lookups = prefetch_engram_lookups(
+                self._engram_modules, input_ids, packed_seq_params
+            )
+
         decoder_padding_mask = padding_mask
         if decoder_input is not None:
             pass
@@ -654,6 +704,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         #   be None, so this assert will succeed.
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
+        if engram_lookups:
+            from megatron.core.models.engram.async_lookup import join_lookup_stream_in_backward
+
+            join_lookup_stream_in_backward(decoder_input)
+
         # Pass input_ids to decoder for hash-based MoE routing.
         decoder_extra_block_kwargs = {}
         if self.config.engram_enabled:
@@ -668,6 +723,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.config.moe_n_hash_layers > 0 or self.config.engram_enabled
         ) and input_ids is not None:
             decoder_extra_block_kwargs['input_ids'] = input_ids
+        if engram_lookups:
+            decoder_extra_block_kwargs['engram_lookups'] = engram_lookups
 
         # Run decoder.
         decoder_output = self.decoder(

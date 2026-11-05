@@ -61,6 +61,7 @@ from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.models.engram.async_lookup import plan_engram_lookups
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -4882,6 +4883,11 @@ def train_step(
             )
             MTPLossLoggingHelper.configure_acceptance_collection(enabled=has_acceptance_consumer)
         if args.engram_enabled:
+            # Packed (--sft) rows need their document boundaries to be hashed, which only
+            # get_batch produces; their lookups route themselves per microbatch instead.
+            plan_engram_lookups_this_step = args.engram_async_lookup and not getattr(
+                args, "sft", False
+            )
             forward_backward_data_iterator = prepare_tokens_for_pipeline(
                 forward_backward_data_iterator,
                 num_microbatches,
@@ -4889,7 +4895,15 @@ def train_step(
                 args.seq_length,
                 mpu.get_pipeline_model_parallel_group(),
                 mpu.get_tensor_model_parallel_group(),
+                prefetch_all=plan_engram_lookups_this_step,
             )
+            if plan_engram_lookups_this_step:
+                token_iterator = (
+                    forward_backward_data_iterator[0]
+                    if isinstance(forward_backward_data_iterator, list)
+                    else forward_backward_data_iterator
+                )
+                plan_engram_lookups(model, token_iterator.peek_pipeline_tokens())
         grad_context, forward_only = _forward_backward_grad_context(args)
         _fb_cm = (
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=get_num_microbatches())

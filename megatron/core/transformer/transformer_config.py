@@ -257,6 +257,13 @@ class TransformerConfig(ModelParallelConfig):
     Engram shards its lookup tables over the expert-parallel dimension, so enabling it
     also permits expert parallelism without MoE experts."""
 
+    engram_async_lookup: bool = False
+    """Issue each Engram layer's lookup before the embedding, on a dedicated CUDA stream and
+    communicator, so it overlaps the layers in front of it; route a step's microbatches up
+    front with one request-count exchange; keep the lookup out of full-recompute replays and
+    run its backward off the compute stream. Results are bitwise identical to the inline
+    lookup. HybridModel only; the Engram layers must be on the first pipeline stage."""
+
     rotary_interleaved: bool = False
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
