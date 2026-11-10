@@ -162,6 +162,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 "mtp_hybrid_override_pattern is not supported by GPTModel. "
                 "For GPT models, define MTP layers through mtp_block_spec."
             )
+        if self.config.engram_enabled:
+            raise ValueError(
+                "Engram is not supported by GPTModel, which would silently train without it. "
+                "Engram is integrated into HybridModel (pretrain_hybrid.py) only."
+            )
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
