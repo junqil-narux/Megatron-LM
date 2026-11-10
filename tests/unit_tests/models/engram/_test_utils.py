@@ -69,6 +69,6 @@ def make_module_config(
     )
 
 
-def make_pg_collection(ep=None, tp=None, expt_dp=None) -> ProcessGroupCollection:
+def make_pg_collection(ep=None, tp=None, expt_dp=None, cp=None) -> ProcessGroupCollection:
     """Build only the process groups used by the Engram module."""
-    return ProcessGroupCollection(ep=ep, tp=tp, expt_dp=expt_dp)
+    return ProcessGroupCollection(ep=ep, tp=tp, expt_dp=expt_dp, cp=cp)

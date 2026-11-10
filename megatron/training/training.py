@@ -78,6 +78,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
+    get_engram_config_overrides,
     get_megatron_optimizer,
     get_mup_config_overrides,
     get_standard_config_overrides,
@@ -178,7 +179,11 @@ from megatron.training.logging.packed_sequence_stats import (
     update_packed_sequence_stats,
 )
 from megatron.training.models import ModelConfig
-from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
+from megatron.training.utils import (
+    is_gtp_remat_active,
+    is_hybrid_model,
+    prepare_tokens_for_pipeline,
+)
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -4453,6 +4458,14 @@ def setup_model_and_optimizer(
             )
             if mup_overrides:
                 optim_cfg_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
+        engram_config = getattr(cfg.model, "engram_config", None)
+        if engram_config is not None:
+            engram_overrides = get_engram_config_overrides(
+                optim_cfg,
+                lr_multiplier=engram_config.embedding_lr_multiplier,
+                weight_decay=engram_config.embedding_weight_decay,
+            )
+            optim_cfg_overrides = {**(optim_cfg_overrides or {}), **engram_overrides}
 
         optimizer = get_megatron_optimizer(
             optim_cfg,
@@ -5044,6 +5057,22 @@ def train_step(
         if getattr(config, "sequence_packing_scheduler", None) is not None:
             set_seqlen_stats_in_iteration(
                 seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch
+            )
+
+        if getattr(cfg.model.transformer, "engram_enabled", False):
+            # Every pipeline stage needs the raw token IDs, but only the first one reads the
+            # data iterator, so broadcast them down the pipeline before the schedule starts.
+            # Prefetching inside this loop repeats it for a rerun, and rerun_data_iterator stays
+            # the RerunDataIterator that the rerun state machine expects. (Engram rejects the
+            # sequence-packing scheduler, so data_iterator is the schedule's iterator here.)
+            engram_pg_collection = _get_model_pg_collection(model[0])
+            forward_backward_data_iterator = prepare_tokens_for_pipeline(
+                data_iterator,
+                scheduled_num_microbatches,
+                cfg.train.micro_batch_size,
+                args.seq_length,
+                engram_pg_collection.pp,
+                engram_pg_collection.tp,
             )
 
         # In the delayed MXFP8 path, optimizer state was offloaded above while masters
@@ -7539,6 +7568,16 @@ def evaluate(
     # leave behind, an empty accumulator.
     reset_seqlen_stats_in_iteration()
 
+    if (
+        getattr(cfg.model.transformer, "engram_enabled", False)
+        and process_non_loss_data_func is not None
+        and non_loss_data_func is None
+    ):
+        # This extra pass runs a last-rank-only forward, so the collective Engram token
+        # prefetch cannot be prepared for it. Raise on every rank so the job fails cleanly
+        # instead of hanging the peers at their next collective.
+        raise RuntimeError("Engram does not support process_non_loss_data_func evaluation.")
+
     step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
     step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
 
@@ -7634,6 +7673,16 @@ def evaluate(
             else:
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
+
+            if getattr(cfg.model.transformer, "engram_enabled", False):
+                packed_data_iterator = prepare_tokens_for_pipeline(
+                    packed_data_iterator,
+                    scheduled_eval_num_microbatches,
+                    eval_micro_batch_size,
+                    args.seq_length,
+                    eval_pgc.pp,
+                    eval_pgc.tp,
+                )
 
             ft_integration.on_eval_step_start()
 
