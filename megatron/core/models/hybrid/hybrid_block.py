@@ -421,6 +421,17 @@ class HybridStack(MegatronModule):
             self.layers = group_layers_into_shortcut_blocks(
                 self.layers, self.layer_type_list, self.config, pp_layer_offset=pp_layer_offset
             )
+            for layer in self.layers:
+                # Both halves of a shortcut pair run outside TransformerLayer._forward_attention,
+                # where the Engram residual is added, so the memory would be silently skipped.
+                if isinstance(layer, ShortcutMoEBlock) and (
+                    self._uses_engram(layer.compute_layer) or self._uses_engram(layer.moe_layer)
+                ):
+                    raise ValueError(
+                        "Engram cannot run inside a shortcut MoE pair (layers "
+                        f"{layer.compute_layer.layer_number} and {layer.moe_layer.layer_number}): "
+                        "both halves bypass the layer entry point that applies the memory."
+                    )
             self._execution_layer_indices = [
                 (
                     layer.attn_local_idx
@@ -505,6 +516,12 @@ class HybridStack(MegatronModule):
             tp_group=self.tp_group,
             tp_cp_group=runtime_tp_cp_group,
         )
+
+    @staticmethod
+    def _uses_engram(layer: torch.nn.Module) -> bool:
+        """Return whether a (possibly mHC-wrapped) TransformerLayer owns an Engram memory."""
+        inner_layer = getattr(layer, "inner_layer", layer)
+        return getattr(inner_layer, "engram", None) is not None
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -601,8 +618,8 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
-            input_ids (Tensor, optional): Token IDs forwarded to hash-routed
-                TransformerLayer instances. Defaults to None.
+            input_ids (Tensor, optional): Token IDs forwarded to hash-routed and
+                Engram-owning TransformerLayer instances. Defaults to None.
         Returns:
             Tensor: the output tensor.
         """
@@ -618,6 +635,24 @@ class HybridStack(MegatronModule):
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 thd_plan=cp_layout_plan,
             )
+
+        # The token IDs arrive in the boundary CP layout. An Engram memory hashes the tokens of
+        # the positions its layer holds, so the IDs are converted to the layouts of the layers
+        # that own one. Hash-routed MoE layers keep taking the IDs as they arrive.
+        input_ids_by_layout = None
+        if cp_layout_state is not None and input_ids is not None:
+            engram_layouts = {
+                cp_layout_state.manager.layer_layouts[physical_layer_idx]
+                for physical_layer_idx, layer in zip(
+                    self._execution_layer_indices, self.layers, strict=True
+                )
+                if self._uses_engram(layer)
+            }
+            if engram_layouts:
+                input_ids_by_layout = {
+                    layout: cp_layout_state.convert_sequence_metadata(input_ids, layout)
+                    for layout in engram_layouts
+                }
 
         packed_sequence_cp_metadata = None
         if (
@@ -731,6 +766,7 @@ class HybridStack(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     input_ids=input_ids,
+                    input_ids_by_layout=input_ids_by_layout,
                     padding_mask_by_layout=padding_mask_by_layout,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
@@ -827,8 +863,22 @@ class HybridStack(MegatronModule):
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
-                                if input_ids is not None and self._uses_hash_routing(layer):
-                                    layer_kwargs["input_ids"] = input_ids
+                                # Only hash-routed MoE layers and Engram memories consume the
+                                # token IDs; the other layers keep their exact kwarg set, which
+                                # TE CUDA graphs fix at capture.
+                                if input_ids is not None:
+                                    if self._uses_engram(layer):
+                                        layer_kwargs["input_ids"] = (
+                                            input_ids_by_layout[
+                                                cp_layout_state.manager.layer_layouts[
+                                                    physical_layer_idx
+                                                ]
+                                            ]
+                                            if input_ids_by_layout is not None
+                                            else input_ids
+                                        )
+                                    elif self._uses_hash_routing(layer):
+                                        layer_kwargs["input_ids"] = input_ids
                                 hidden_states, _ = layer(hidden_states, **layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(

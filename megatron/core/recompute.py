@@ -33,6 +33,7 @@ def checkpointed_forward(
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
+    input_ids_by_layout: Optional[dict[CPLayout, Tensor]] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -45,7 +46,10 @@ def checkpointed_forward(
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
-        input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE and Engram layers.
+        input_ids_by_layout (dict, optional): The token IDs in the CP layouts of the layers that
+            own an Engram memory; such a layer receives the entry of its own layout instead of
+            ``input_ids``.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -125,8 +129,17 @@ def checkpointed_forward(
                 )
                 inner_layer = getattr(layer, "inner_layer", layer)
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
-                if input_ids is not None and getattr(router, "is_hash_layer", False):
-                    layer_kwargs["input_ids"] = input_ids
+                # Engram layers hash the token IDs too (before attention), so they need them
+                # whether or not their MLP is hash-routed, and in the CP layout they run in.
+                owns_engram = getattr(inner_layer, "engram", None) is not None
+                if input_ids is not None and (
+                    owns_engram or getattr(router, "is_hash_layer", False)
+                ):
+                    layer_kwargs["input_ids"] = (
+                        input_ids_by_layout[cp_layout_state.manager.layer_layouts[index]]
+                        if owns_engram and input_ids_by_layout is not None
+                        else input_ids
+                    )
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(hidden_states, **layer_kwargs)
