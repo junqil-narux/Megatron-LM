@@ -318,6 +318,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
         mtp_overlap_configs = (self.config,)
         if self.hybrid_layer_config_list is not None:
+            if self.config.engram_enabled:
+                # apply_engram_to_hybrid_stack_spec resolves the Engram layer IDs through the
+                # pattern string, which the config-list path never synthesizes.
+                raise ValueError(
+                    "Engram cannot be used with hybrid_layer_config_list; place its memory "
+                    "layers through hybrid_layer_pattern instead"
+                )
             if self.config.pipeline_model_parallel_layout is not None:
                 raise ValueError(
                     "pipeline_model_parallel_layout cannot be used with "
@@ -493,6 +500,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         _validate_hash_moe_pipeline_placement(
             layer_config_list, layer_offset, hash_moe_layer_threshold, self.pre_process
         )
+        if (
+            self.config.engram_enabled
+            and self.config.moe_num_hash_layers > 0
+            and self.config.sequence_parallel
+        ):
+            # Engram hashes the full TP-local row of token IDs (n-grams cross shard boundaries)
+            # and slices the hashes for sequence parallelism itself, so the decoder gets the IDs
+            # unscattered, while the TE CUDA-graph inputs of hash-routed MoE layers expect the
+            # sequence-parallel shard.
+            raise ValueError(
+                "Engram cannot be combined with hash-routed MoE layers (moe_num_hash_layers > 0) "
+                "under sequence parallelism."
+            )
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -830,11 +850,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Hash routing consumes batch-major token IDs. Under sequence parallelism,
         # shard them with decoder activations so each TP rank hashes its local tokens.
+        # Engram also consumes the token IDs, but unsharded: it hashes the full row and slices
+        # the hashes for sequence parallelism itself (the combination of both under SP is
+        # rejected in __init__).
+        engram_enabled = getattr(self.config, "engram_enabled", False)
         hash_input_ids = None
-        if self.config.moe_num_hash_layers > 0:
+        if self.config.moe_num_hash_layers > 0 or engram_enabled:
             hash_input_ids = input_ids
         if (
             self.config.sequence_parallel
+            and not engram_enabled
             and decoder_input is not None
             and hash_input_ids is not None
             and hash_input_ids.shape[1] != decoder_input.shape[0]
@@ -960,6 +985,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if self.hybrid_layer_config_list is not None and self._decoder_uses_mla
             else rotary_pos_emb
         )
+
+        if engram_enabled:
+            # Checked here rather than in the Engram layers: every pipeline stage runs this,
+            # so an unsupported input fails the job instead of hanging the stages that do not
+            # own an Engram layer in their pipeline collectives.
+            if inference_context is not None or in_inference_mode:
+                raise ValueError("Engram does not support inference or generation.")
+            if input_ids is None:
+                raise ValueError("Engram requires input token IDs on every pipeline stage.")
 
         # Run decoder.
         backbone_context = (

@@ -62,7 +62,11 @@ from megatron.training.training import (
     update_seqlen_stats_from_cu_seqlens,
     update_seqlen_stats_from_padding_mask,
 )
-from megatron.training.utils import is_first_or_last_pipeline_stage, prepare_packed_seq_params
+from megatron.training.utils import (
+    get_pipeline_prefetched_tokens,
+    is_first_or_last_pipeline_stage,
+    prepare_packed_seq_params,
+)
 from model_provider import model_provider
 
 try:
@@ -98,6 +102,21 @@ BATCH_KEYS = [
 ]
 
 
+def _engram_tokens(data_iterator, tokens):
+    """Return this microbatch's n-gram memory tokens, distributed before the schedule.
+
+    Every pipeline stage needs the token IDs, including middle stages that own no batch, so
+    the tokens come from the pre-schedule broadcast rather than this rank's data iterator.
+    """
+    prefetched_tokens = get_pipeline_prefetched_tokens(data_iterator)
+    if tokens is None:
+        # Stages that hold no tokens of their own take the full row, which the prefetch pads
+        # to the fixed pipeline activation length.
+        return prefetched_tokens
+    # Keep the batch's own length, so the row stays aligned with its labels and cu_seqlens.
+    return prefetched_tokens[..., : tokens.shape[-1]]
+
+
 # The args object and the transformer config built from it, reused until the args object
 # is replaced.
 _transformer_config_cache = None
@@ -113,6 +132,29 @@ def _get_transformer_config(args):
     if _transformer_config_cache is None or _transformer_config_cache[0] is not args:
         _transformer_config_cache = (args, core_transformer_config_from_args(args))
     return _transformer_config_cache[1]
+
+
+def _split_batch_over_cp(batch, args, config):
+    """Partition a batch that every TP rank holds over the context-parallel ranks."""
+    additional_layouts = set()
+    if args.context_parallel_size > 1 and config.linear_cp_layout != config.attention_cp_layout:
+        additional_layouts.add(config.attention_cp_layout)
+    return get_batches_on_this_cp_rank(
+        batch,
+        boundary_layout=config.linear_cp_layout,
+        dynamic_cp=False,
+        cp_group=get_context_parallel_group(),
+        additional_layouts=additional_layouts,
+        use_per_sequence_balancing=args.dataloader_inter_document_masking and not args.sft,
+        sequence_parallel=config.sequence_parallel,
+        tp_group=mpu.get_tensor_model_parallel_group(),
+        tp_cp_group=(
+            mpu.get_tensor_and_context_parallel_group()
+            if config.sequence_parallel and config.tensor_model_parallel_size > 1
+            else None
+        ),
+        tokens_per_sample=args.seq_length,
+    )
 
 
 def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
@@ -186,11 +228,18 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         and not has_cu_seqlens
         and not needs_padding_mask
     ):
-        return ContextParallelBatch(
-            boundary_layout=config.linear_cp_layout,
-            batches_by_layout={config.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
-            packed_seq_params_by_layout={config.linear_cp_layout: None},
-        )
+        if not args.engram_enabled:
+            return ContextParallelBatch(
+                boundary_layout=config.linear_cp_layout,
+                batches_by_layout={config.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
+                packed_seq_params_by_layout={config.linear_cp_layout: None},
+            )
+        # Engram layers on this stage hash the token row broadcast before the schedule. The
+        # stage builds no dataset, and every TP rank already holds the full row, so there is
+        # nothing to read, broadcast or flatten: only split the row over CP.
+        batch = dict.fromkeys(BATCH_KEYS)
+        batch["tokens"] = _engram_tokens(data_iterator, None)
+        return _split_batch_over_cp(batch, args, config)
 
     batch = {}
     if tp_rank == 0:
@@ -228,6 +277,12 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         # reported TFLOP/s count useful work only, like the packed THD path.
         update_seqlen_stats_from_padding_mask(batch["padding_mask"])
 
+    if args.engram_enabled:
+        # Before flattening: flatten_batch_for_packed_sequences reshapes tokens together with
+        # labels and merges cu_seqlens, so substituting afterwards would restore the unflattened
+        # shape and silently misalign tokens against labels.
+        batch['tokens'] = _engram_tokens(data_iterator, batch.get('tokens'))
+
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
@@ -240,27 +295,11 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             'cu_seqlens_padded': batch.get('cu_seqlens_padded'),
             'max_seqlen': batch.get('max_seqlen'),
             'padding_mask': batch.get('padding_mask'),
+            # Engram layers on middle stages consume the pipeline-prefetched tokens.
+            'tokens': batch.get('tokens') if args.engram_enabled else None,
         }
 
-    additional_layouts = set()
-    if cp_size > 1 and config.linear_cp_layout != config.attention_cp_layout:
-        additional_layouts.add(config.attention_cp_layout)
-    return get_batches_on_this_cp_rank(
-        batch,
-        boundary_layout=config.linear_cp_layout,
-        dynamic_cp=False,
-        cp_group=get_context_parallel_group(),
-        additional_layouts=additional_layouts,
-        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
-        sequence_parallel=config.sequence_parallel,
-        tp_group=mpu.get_tensor_model_parallel_group(),
-        tp_cp_group=(
-            mpu.get_tensor_and_context_parallel_group()
-            if config.sequence_parallel and config.tensor_model_parallel_size > 1
-            else None
-        ),
-        tokens_per_sample=args.seq_length,
-    )
+    return _split_batch_over_cp(batch, args, config)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -538,6 +577,8 @@ if __name__ == "__main__":
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+        # The ModelOpt builder uses its own stack spec, which never carries the Engram memory.
+        assert not args.engram_enabled, "Engram does not support ModelOpt model building."
         model_cfg = hybrid_config_from_args(
             args, model_config_cls=ModelOptHybridModelConfig, vocab_size_from_tokenizer=True
         )

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from typing import List, Optional, Tuple
@@ -244,6 +244,24 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             getattr(self.inner_layer, 'mlp', None), MoELayer
         )
 
+    def _inner_layer_owns_engram(self) -> bool:
+        """True when the wrapped layer carries an Engram memory, which this wrapper applies."""
+        return getattr(getattr(self, "inner_layer", None), "engram", None) is not None
+
+    def _reject_engram_cuda_graph(self) -> None:
+        """Keep a wrapper whose inner layer owns an Engram memory out of TE CUDA graphs.
+
+        The graph paths either call ``hyper_connection`` and the inner sublayers directly, which
+        skips the Engram residual that ``forward`` adds, or capture ``forward`` without the
+        token IDs as a static input; the Engram lookup also has data-dependent shapes.
+        """
+        if self._inner_layer_owns_engram():
+            raise RuntimeError(
+                f"Hybrid layer {self.layer_number} owns an Engram memory, which CUDA graphs "
+                "cannot capture; restrict cuda_graph_modules to the MoE scopes and keep Engram "
+                "off MoE layers."
+            )
+
     def _inner_is_partial_moe_capture(self) -> bool:
         """True when the inner layer is MoE and the configured ``cuda_graph_modules`` request
         partial MoE capture (``moe_router``).
@@ -418,6 +436,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             "Hybrid CUDA graph capture body received raw THD sequence tensors. "
             "The outer capture boundary must reconstruct PackedSeqParams first."
         )
+        self._reject_engram_cuda_graph()
 
         if self._uses_mhc_recompute_attn_cuda_graph_split():
             return self._forward_mhc_attention_cuda_graph_consumer(*args, **kwargs)
@@ -569,6 +588,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def _te_cuda_graph_replay_impl(self, args, kwargs):
         """Replay the wrapper graph, then run any eager continuation."""
+        self._reject_engram_cuda_graph()
         if self._uses_mhc_recompute_attn_cuda_graph_split():
             return self._replay_mhc_attention_cuda_graph(args, kwargs)
 
@@ -677,6 +697,10 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
                 input_ids=input_ids,
+                # forward() already added the Engram memory to the n-stream tensor, before the
+                # read gate; the inner layer must not add it a second time. Only passed to
+                # layers that own one, so the others keep their CUDA-graph kwarg set.
+                **({"skip_engram": True} if self._inner_layer_owns_engram() else {}),
                 _called_from_hybrid_mhc_wrapper=True,
             )
         else:
@@ -796,6 +820,15 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
         if mhc_recompute_manager is None:
             mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
+
+        if self._inner_layer_owns_engram():
+            # The memory belongs to the residual streams, not to the wrapped layer's branch
+            # delta, so it is added to the n-stream tensor before the read gate. Both inner
+            # paths below bypass TransformerLayer's own injection: the fast path calls the
+            # sublayer helpers directly, and the fallback path passes skip_engram=True.
+            hidden_states = self.inner_layer._maybe_apply_engram(
+                hidden_states, input_ids, packed_seq_params
+            )
 
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
