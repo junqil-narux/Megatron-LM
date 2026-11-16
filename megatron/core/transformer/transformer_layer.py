@@ -1252,7 +1252,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         engram = getattr(self, "engram", None)
         if engram is None:
             return hidden_states
-        return hidden_states + engram(hidden_states, input_ids, packed_seq_params)
+        return engram(hidden_states, input_ids, packed_seq_params, add_to_hidden_states=True)
 
     @copy_signature(_forward_attention)
     def forward(self, hidden_states: Tensor, /, *args, **kwargs):
