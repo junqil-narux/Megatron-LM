@@ -13,10 +13,12 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.core.context_parallel.layout as cp_layout_module
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.engram import apply_engram_to_hybrid_stack_spec
 from megatron.core.models.engram.config import EngramConfig
+from megatron.core.models.engram.cp_layout import resolve_layer_cp_layout
 from megatron.core.models.engram.engram import Engram
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
@@ -26,6 +28,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.identity_op import IdentityOp
@@ -646,3 +649,93 @@ def test_hybrid_model_rejects_engram_with_hash_routing_under_sequence_parallelis
     )
     with pytest.raises(ValueError, match="hash-routed MoE layers"):
         _hybrid_model(monkeypatch, config, hybrid_layer_pattern=Symbols.ATTENTION + Symbols.MOE)
+
+
+class _SizedGroup:
+    """A stand-in process group that only answers ``size()``."""
+
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
+@pytest.mark.parametrize("full_recompute", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_mixed_stack_hands_engram_layers_their_layout(monkeypatch, full_recompute, packed):
+    """A stack of zigzag and contiguous layers gives each memory the tokens of its layout.
+
+    The layer configs, the layout manager and its state are the real ones; only the collective
+    that converts a tensor between layouts is replaced, by one that tags converted token IDs.
+    """
+    monkeypatch.setattr(
+        tensor_parallel,
+        "checkpoint",
+        lambda function, _distribute_saved_activations, *args: function(*args),
+    )
+
+    def convert(input_, source_layout, target_layout, *args):
+        if source_layout == target_layout or input_.dtype != torch.int64:
+            return input_
+        return input_ + 1000
+
+    monkeypatch.setattr(cp_layout_module, "convert_cp_layout", convert)
+
+    recompute = (
+        dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=3)
+        if full_recompute
+        else {}
+    )
+    config = _transformer_config(
+        num_layers=3, linear_cp_layout="contiguous", attention_cp_layout="zigzag", **recompute
+    )
+    # Attention, MoE, MLP.
+    layer_configs = validate_segment_layers("*E-", config)
+    layers = [
+        _RecordingLayer(layer_number=index + 1, engram=_MemoryStub(), config=layer_config)
+        for index, layer_config in enumerate(layer_configs)
+    ]
+    one = _SizedGroup(1)
+    with mock.patch("megatron.core.models.hybrid.hybrid_block.build_module", side_effect=layers):
+        stack = HybridStack(
+            config=config,
+            submodules=HybridStackSubmodules(),
+            layer_config_list=layer_configs,
+            post_process=False,
+            post_layer_norm=False,
+            pg_collection=SimpleNamespace(pp=one, tp=one, cp=_SizedGroup(2), tp_cp=None),
+        )
+    layouts = stack._cp_layout_manager.layer_layouts
+    assert layouts == ("zigzag", "contiguous", "contiguous")
+    # What each memory resolves from the config of its own layer.
+    assert layouts == tuple(resolve_layer_cp_layout(layer.config) for layer in layers)
+
+    input_ids = torch.arange(8).view(2, 4)
+    packed_seq_params_by_layout = None
+    if packed:
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        packed_seq_params_by_layout = {
+            layout: PackedSeqParams(
+                qkv_format="thd", cu_seqlens_q=cu_seqlens, cp_partition_mode=layout
+            )
+            for layout in ("zigzag", "contiguous")
+        }
+    HybridStack.forward(
+        stack,
+        hidden_states=torch.randn(4, 2, 8),
+        attention_mask=None,
+        input_ids=input_ids,
+        packed_seq_params=packed_seq_params_by_layout["contiguous"] if packed else None,
+        packed_seq_params_by_layout=packed_seq_params_by_layout,
+        cp_layout_plan=object() if packed else None,
+    )
+    for layer, layout in zip(layers, layouts):
+        call = layer.calls[0]
+        # The stage boundary is contiguous, so only the zigzag layer gets converted tokens.
+        expected_ids = input_ids if layout == "contiguous" else input_ids + 1000
+        assert torch.equal(call["input_ids"], expected_ids)
+        if packed:
+            assert call["packed_seq_params"] is packed_seq_params_by_layout[layout]
+        else:
+            assert call["packed_seq_params"] is None
