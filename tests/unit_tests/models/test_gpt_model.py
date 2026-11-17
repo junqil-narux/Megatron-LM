@@ -259,6 +259,22 @@ class TestGPTModel:
                 max_sequence_length=4,
             )
 
+    def test_rejects_engram(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            engram_enabled=True,
+        )
+        with pytest.raises(ValueError, match="Engram is not supported by GPTModel"):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
     @pytest.mark.internal
     def test_set_input_tensor(self):
         config: TransformerConfig = self.gpt_model.config

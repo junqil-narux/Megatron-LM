@@ -1119,6 +1119,51 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "numerical CP parity is covered by test_dsv4_packed_cp.py.",
     ),
     KernelEntry(
+        name="engram_embedding",
+        sources=("megatron/core/models/engram/distributed_embedding.py",),
+        tests=(
+            "tests/unit_tests/models/engram/test_engram_numerics.py",
+            "tests/unit_tests/models/engram/test_ownership_and_optimizer.py",
+            "tests/unit_tests/models/engram/test_distributed_lookup.py",
+            "tests/unit_tests/models/engram/test_table_sharding.py",
+            "tests/unit_tests/models/engram/test_table_sharding_optimizer.py",
+        ),
+        kind="torch-op",
+        notes="EP-sharded Engram tables: F.embedding lookup, or under deterministic_mode a "
+        "sorted segment_reduce backward that writes each touched row once; torch.bincount counts "
+        "the integer per-(peer, table) requests of the multi-rank all-to-all. "
+        "test_engram_numerics checks the single-rank lookup in both modes against an independent "
+        "FP64 F.embedding reference on CPU, and replays the deterministic backward bit-exactly on "
+        "GPU under stream contention. test_ownership_and_optimizer checks the deterministic "
+        "backward's sum over repeated rows exactly on CPU, and test_distributed_lookup checks the "
+        "EP2 and EP4 all-to-all lookup, its owner-side gradients and an Adam step against a "
+        "full-table FP64 reference on GPU; the multi-rank routing has no bit-exact replay yet. "
+        "test_table_sharding checks the lookup and owner-side gradients with the rows sharded "
+        "over DP x CP against the EP layout and a full-table FP32 reference, bit for bit with "
+        "integer gradients, and that the source stays byte-identical to PR 8225's; "
+        "test_table_sharding_optimizer trains both layouts through DDP and the distributed "
+        "optimizer and compares them bit for bit.",
+    ),
+    KernelEntry(
+        name="engram_symmetric_lookup",
+        sources=(
+            "megatron/core/models/engram/symmetric_lookup.py",
+            "megatron/core/ops/engram.py",
+            "megatron/core/ops/engram_row_accumulation.py",
+        ),
+        tests=(
+            K + "test_engram_transport.py",
+            "tests/unit_tests/models/engram/test_symmetric_lookup.py",
+            "tests/unit_tests/ops/test_engram.py",
+        ),
+        kind="triton",
+        notes=(
+            "Sorted-segment FP32 Triton row accumulation without atomics; integer bincount "
+            "counts; the CuTe/NCCL exchange and lookup only copy bytes; replayed bit-exactly "
+            "under contention."
+        ),
+    ),
+    KernelEntry(
         name="dsa_dispatch",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
         tests=(K + "test_fused_triton_kernels.py",),
