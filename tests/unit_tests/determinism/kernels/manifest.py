@@ -1153,12 +1153,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="engram_routed_lookup",
         sources=("megatron/core/models/engram/routed_lookup.py",),
-        tests=("tests/unit_tests/models/engram/test_lookup_counts.py",),
+        tests=(
+            "tests/unit_tests/models/engram/test_lookup_counts.py",
+            "tests/unit_tests/models/engram/test_routed_lookup.py",
+        ),
         kind="torch-op",
         notes="scatter_add_ of int64 ones counts the integer per-(owner, table) requests of a "
         "lookup; integer sums do not depend on the order of accumulation. test_lookup_counts "
         "compares the counts with torch.bincount exactly on CPU and GPU, with and without "
-        "deterministic algorithms.",
+        "deterministic algorithms. The routed lookup runs the all-to-alls and the owner-side "
+        "table lookups of engram_embedding's forward as separate steps; test_routed_lookup "
+        "compares its rows, table gradients and exchanged buffers with that forward bit for "
+        "bit at EP2 and EP4, in both modes of the table lookup.",
     ),
     KernelEntry(
         name="engram_symmetric_lookup",
