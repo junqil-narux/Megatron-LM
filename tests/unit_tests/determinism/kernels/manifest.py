@@ -1151,6 +1151,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "optimizer and compares them bit for bit.",
     ),
     KernelEntry(
+        name="engram_routed_lookup",
+        sources=("megatron/core/models/engram/routed_lookup.py",),
+        tests=("tests/unit_tests/models/engram/test_lookup_counts.py",),
+        kind="torch-op",
+        notes="scatter_add_ of int64 ones counts the integer per-(owner, table) requests of a "
+        "lookup; integer sums do not depend on the order of accumulation. test_lookup_counts "
+        "compares the counts with torch.bincount exactly on CPU and GPU, with and without "
+        "deterministic algorithms.",
+    ),
+    KernelEntry(
         name="engram_symmetric_lookup",
         sources=(
             "megatron/core/models/engram/symmetric_lookup.py",

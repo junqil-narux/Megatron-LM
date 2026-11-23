@@ -92,6 +92,28 @@ def make_pg_collection(ep=None, tp=None, expt_dp=None, cp=None) -> ProcessGroupC
     return ProcessGroupCollection(ep=ep, tp=tp, expt_dp=expt_dp, cp=cp)
 
 
+@contextmanager
+def deterministic_algorithms(enabled: bool):
+    """Mirror --deterministic-mode, which turns on torch.use_deterministic_algorithms."""
+    previous = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(enabled)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous)
+
+
+@contextmanager
+def sync_debug_mode(mode: str):
+    """Make synchronizing CUDA calls warn (``"warn"``) or raise (``"error"``) in the block."""
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode(mode)
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+
+
 def _world_device() -> torch.device:
     if dist.get_backend() == "nccl":
         return torch.device("cuda", torch.cuda.current_device())
