@@ -1156,6 +1156,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/models/engram/test_lookup_counts.py",
             "tests/unit_tests/models/engram/test_routed_lookup.py",
+            "tests/unit_tests/models/engram/test_async_lookup.py",
         ),
         kind="torch-op",
         notes="scatter_add_ of int64 ones counts the integer per-(owner, table) requests of a "
@@ -1164,7 +1165,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "deterministic algorithms. The routed lookup runs the all-to-alls and the owner-side "
         "table lookups of engram_embedding's forward as separate steps; test_routed_lookup "
         "compares its rows, table gradients and exchanged buffers with that forward bit for "
-        "bit at EP2 and EP4, in both modes of the table lookup.",
+        "bit at EP2 and EP4, in both modes of the table lookup. test_async_lookup issues the "
+        "routed lookup and its backward on a CUDA stream and a communicator of their own "
+        "(megatron/core/models/engram/async_lookup.py, which launches no kernel itself) and "
+        "compares the outputs and DDP's reduced gradients of a step with the inline lookup's "
+        "bit for bit, in both table layouts, and in both modes for the expert-parallel layout.",
     ),
     KernelEntry(
         name="engram_symmetric_lookup",

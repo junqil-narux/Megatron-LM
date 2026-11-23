@@ -165,12 +165,16 @@ def tag_engram_tables(embedding: EPShardedMultiTableEmbedding) -> None:
 
 
 def clear_engram_parallel_state() -> None:
-    """Forget the cached Engram groups.
+    """Forget the cached Engram groups: the table groups and the lookup communicators.
 
     ``parallel_state.destroy_model_parallel`` calls it, so the next model-parallel setup creates
     new groups. Collections that already hold the groups keep their references.
     """
+    # async_lookup imports this module.
+    from .async_lookup import destroy_lookup_groups
+
     _ROW_GROUPS.clear()
+    destroy_lookup_groups()
 
 
 def _uses_symmetric_lookup(engram_config: EngramConfig) -> bool:

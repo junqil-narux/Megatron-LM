@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import deque
 from typing import NamedTuple
 
 import torch
@@ -31,8 +32,16 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    ensure_params_ready,
+    get_pg_rank,
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
+from . import routed_lookup
+from .async_lookup import EngramLookupHandle, get_lookup_group, get_lookup_stream
 from .config import EngramConfig
 from .cp_layout import (
     CONTIGUOUS_CP_LAYOUT,
@@ -399,6 +408,19 @@ class Engram(MegatronModule):
             persistent=False,
         )
 
+        if engram_config.async_lookup:
+            # The lookup issued ahead of this layer is a routed NCCL lookup on a CUDA stream.
+            if engram_config.communication_backend != "nccl":
+                raise ValueError(
+                    "Engram async_lookup issues the lookup as NCCL all-to-alls and requires "
+                    f"communication_backend='nccl', got {engram_config.communication_backend!r}."
+                )
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Engram async_lookup runs the lookup on a CUDA stream of its own and needs "
+                    "CUDA."
+                )
+
         # The rows are sharded over the expert-parallel group (EP layout) or over a slice of
         # dp_cp (engram_config.parallel_size); the embedding takes either through its EP and
         # expert-DP arguments.
@@ -426,6 +448,22 @@ class Engram(MegatronModule):
         # a bound method or a plain object, never a submodule, so the state dict keeps only the
         # embedding's keys.
         self._lookup = make_lookup(self.embedding)
+        # Asynchronous lookup (async_lookup): the communicator its all-to-alls run on, the
+        # lookup bound to this module for the current call, and the routes planned for the
+        # microbatches of the step that are still to come.
+        self.lookup_group = None
+        self.prefetched_lookup: EngramLookupHandle | None = None
+        self.planned_routes: deque = deque()
+        if engram_config.async_lookup:
+            if self.embedding.ep_size > 1:
+                self.lookup_group = get_lookup_group(row_group)
+            if not engram_config.freeze_embedding:
+                # The table gradients are produced on the lookup stream. DDP creates their
+                # accumulators on the stream a parameter names, so that accumulating them
+                # does not make the compute stream wait for the lookup's backward.
+                lookup_stream = get_lookup_stream()
+                for table in self.embedding.tables:
+                    table.weight.grad_accumulation_stream = lookup_stream
         factory_kwargs = {"device": device, "dtype": config.params_dtype}
         self._gated_fusion = engram_config.variant_spec.fusion == GATED_FUSION
         if self._gated_fusion:
@@ -767,6 +805,131 @@ class Engram(MegatronModule):
         finally:
             nvtx_range_pop(message)
 
+    def route_global_tokens(self, tokens: Tensor) -> routed_lookup.EngramRoute:
+        """Route the lookup of one unpacked microbatch from its whole token rows.
+
+        ``tokens`` holds the ``[B, S]`` rows in sequence order, before any context-parallel
+        split, so no token is gathered. The route covers this rank's positions of the rows, as
+        :meth:`prefetch` looks them up for the same microbatch. Device work only: the counts of
+        the route are still to be exchanged (``routed_lookup.exchange_route_counts``).
+        """
+        cp_size = get_pg_size(self.cp_group)
+        local_sequence_length = self._local_sequence_length(tokens.shape[1] // cp_size)
+        hash_ids, _ = self._hash_ids(
+            tokens, None, None, local_sequence_length, input_is_global=True
+        )
+        return routed_lookup.route(self.embedding, hash_ids)
+
+    def prefetch(
+        self,
+        input_ids: Tensor,
+        packed_seq_params: PackedSeqParams | None = None,
+        route: routed_lookup.EngramRoute | None = None,
+    ) -> EngramLookupHandle | None:
+        """Issue this layer's lookup for one microbatch on the lookup stream (``async_lookup``).
+
+        Returns at once with a handle to the lookup. ``async_lookup.use_prefetched_lookup``
+        binds the handle to this module for the layer's call, and :meth:`forward` then waits
+        for the lookup and runs only the fusion. With a planned ``route`` nothing synchronizes
+        with the host; without one the request counts are exchanged here, which waits for the
+        lookup stream only.
+
+        The lookup is that of :meth:`lookup`: the same rows, valid mask and document bounds,
+        made under the grad mode of this call, so the caller issues it under the grad mode the
+        layer runs in. It is a collective over the row group: every rank issues the lookups of
+        its layers in the same order.
+
+        Without a route the row is hashed from ``input_ids``, which must then be in this
+        layer's context-parallel layout. A stack that mixes layouts converts the model's row
+        for each layer, so the model's row is not known to be in that layout: for a
+        context-parallel row without a route in such a stack this returns None, and the layer
+        looks its rows up inline.
+
+        Args:
+            input_ids: This rank's ``[B, S]`` token row, as the model receives it.
+            packed_seq_params: The packed row's document boundaries, as in :meth:`forward`.
+            route: The route ``async_lookup.plan_engram_lookups`` made for this microbatch,
+                which must be unpacked.
+        """
+        if not self.engram_config.async_lookup:
+            raise RuntimeError(
+                f"Engram layer {self.layer_number} was built without async_lookup and has no "
+                "lookup communicator to issue a lookup ahead on."
+            )
+        cp_size = get_pg_size(self.cp_group)
+        contiguous_cp = cp_size > 1 and self.cp_layout == CONTIGUOUS_CP_LAYOUT
+        row_cu_seqlens, document_lengths = _row_document_bounds(packed_seq_params, contiguous_cp)
+        local_sequence_length = self._local_sequence_length(input_ids.shape[1])
+        if route is not None:
+            positions = (input_ids.shape[0], local_sequence_length)
+            if row_cu_seqlens is not None or tuple(route.shape[:2]) != positions:
+                raise RuntimeError(
+                    f"Engram layer {self.layer_number}: the planned route covers "
+                    f"{tuple(route.shape[:2])} positions of an unpacked row, but this microbatch "
+                    f"has {positions} positions and is "
+                    f"{'unpacked' if row_cu_seqlens is None else 'packed'}; the step's "
+                    "microbatches were planned from other rows or in another order."
+                )
+        elif cp_size > 1:
+            if self._stack_mixes_cp_layouts:
+                return None
+            if row_cu_seqlens is not None:
+                self._check_packed_cp_partition(packed_seq_params)
+
+        # The table modules are called on the lookup stream, where DDP's forward pre-hooks would
+        # wait for an outstanding parameter gather on that stream alone: publish the tables on
+        # the compute stream first.
+        ensure_params_ready(table.weight for table in self.embedding.tables)
+        input_is_global = False
+        if route is None and cp_size > 1:
+            # The context-parallel communicator carries the compute stream's traffic: gather
+            # the tokens there, before the fork.
+            input_ids = _gather_tokens_across_cp(
+                input_ids, self.cp_group, row_cu_seqlens, contiguous=contiguous_cp
+            )
+            input_is_global = True
+        stream = get_lookup_stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        message = "engram.prefetch"
+        nvtx_range_push(message)
+        try:
+            with torch.cuda.stream(stream):
+                valid = None
+                if route is None:
+                    for tensor in (input_ids, row_cu_seqlens, document_lengths):
+                        if tensor is not None and tensor.is_cuda:
+                            tensor.record_stream(stream)
+                    hash_ids, valid = self._hash_ids(
+                        input_ids,
+                        row_cu_seqlens,
+                        document_lengths,
+                        local_sequence_length,
+                        input_is_global,
+                    )
+                    route = routed_lookup.route(self.embedding, hash_ids)
+                    routed_lookup.exchange_route_counts(
+                        [route],
+                        self.embedding.ep_size,
+                        len(self.embedding.tables),
+                        self.lookup_group,
+                    )
+                memory = self._lookup_routed_memory(route)
+                ready = torch.cuda.Event()
+                ready.record(stream)
+        finally:
+            nvtx_range_pop(message)
+        return EngramLookupHandle(memory, valid, row_cu_seqlens, ready)
+
+    def _lookup_routed_memory(self, route: routed_lookup.EngramRoute) -> Tensor:
+        """Fetch the rows of ``route`` over the lookup communicator, as :meth:`_lookup_memory`."""
+        message = "engram.lookup"
+        nvtx_range_push(message)
+        try:
+            rows = routed_lookup.lookup_routed(self.embedding, route, self.lookup_group)
+            return rows.flatten(start_dim=-2).transpose(0, 1).contiguous()
+        finally:
+            nvtx_range_pop(message)
+
     def lookup(
         self,
         input_ids: Tensor,
@@ -830,8 +993,10 @@ class Engram(MegatronModule):
         the hidden dtype.
 
         ``lookup`` takes the result of an earlier :meth:`lookup` call for the same microbatch;
-        ``input_ids`` and ``packed_seq_params`` are then unused. Without it the lookup runs
-        here, which is the same computation in one call.
+        ``input_ids`` and ``packed_seq_params`` are then unused. So are they when a lookup
+        issued ahead with :meth:`prefetch` is bound to the module for this call
+        (``async_lookup.use_prefetched_lookup``) and no ``lookup`` is passed. Without either
+        the lookup runs here, which is the same computation in one call.
         """
         if hidden_states.ndim != 3:
             raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
@@ -841,6 +1006,9 @@ class Engram(MegatronModule):
                 f"Engram expected hidden width {expected_hidden}, got {hidden_states.shape[-1]}."
             )
 
+        if lookup is None and self.prefetched_lookup is not None:
+            handle = self.prefetched_lookup
+            lookup = EngramLookupResult(handle.attach(), handle.valid, handle.cu_seqlens)
         if lookup is None:
             if input_ids is None:
                 raise ValueError("Engram needs input_ids, or the result of an earlier lookup().")
