@@ -219,6 +219,8 @@ class _EngramLookupHandoff(torch.autograd.Function):
                 torch.autograd.backward(handle.memory, grad_memory)
         finally:
             nvtx_range_pop(message)
+        if handle.joins_own_backward:
+            torch.cuda.current_stream().wait_stream(stream)
         handle.memory = None
         return None, None
 
@@ -235,6 +237,9 @@ class EngramLookupHandle:
         valid: The ``[1, S_local, 1]`` mask of the positions that hold a token, or None.
         cu_seqlens: The positions of the documents of a packed row, or None.
         ready: Event recorded on the lookup stream once ``memory`` and ``valid`` are complete.
+        joins_own_backward: Whether the stream that launches the lookup's backward waits for
+            it at once. Set by :func:`join_lookup_stream_in_backward` when the backward pass
+            has no later point to wait at.
     """
 
     def __init__(
@@ -248,6 +253,7 @@ class EngramLookupHandle:
         self.valid = valid
         self.cu_seqlens = cu_seqlens
         self.ready = ready
+        self.joins_own_backward = False
 
     def wait(self) -> None:
         """Make the current stream wait for the lookup and keep its tensors alive for it."""
@@ -334,16 +340,25 @@ def prefetch_engram_lookups(
     return lookups
 
 
-def join_lookup_stream_in_backward(tensor: Tensor) -> None:
+def join_lookup_stream_in_backward(tensor: Tensor, lookups: Optional[dict] = None) -> None:
     """Make the calling stream wait for the lookup stream when backward reaches ``tensor``.
 
     Registered on a tensor in front of every Engram layer, such as the embedding output: when
     the backward reaches it, every Engram layer's backward has launched its lookup's backward
     on the lookup stream, and the gradient accumulation there must be complete before the
-    gradients are reduced and the optimizer reads them. A tensor that does not require grad is
-    in no backward pass, and nothing is registered on it.
+    gradients are reduced and the optimizer reads them.
+
+    A tensor that does not require grad is in no backward pass, and nothing is registered on
+    it. The backward of each lookup in ``lookups`` then makes the stream that launches it wait
+    for it at once, which gives up its overlap with the layers in front.
+
+    Args:
+        tensor: The tensor whose gradient marks the end of the Engram layers' backward.
+        lookups: The handles of :func:`prefetch_engram_lookups` for the same microbatch.
     """
     if not tensor.requires_grad:
+        for handle in (lookups or {}).values():
+            handle.joins_own_backward = True
         return
 
     def _join(grad: Tensor) -> None:

@@ -60,9 +60,15 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnBackend
 from tests.unit_tests.test_utilities import Utils
 
-from ._test_utils import deterministic_algorithms, make_module_config, make_pg_collection
+from ._test_utils import (
+    CompletedLookup,
+    deterministic_algorithms,
+    make_module_config,
+    make_pg_collection,
+)
 from ._test_utils import packed_seq_params as tagged_packed_seq_params
 from ._test_utils import sync_debug_mode, write_tokenizer_map
 
@@ -267,10 +273,8 @@ class _Block(torch.nn.Module):
         return self.engram(hidden, input_ids, packed_seq_params, add_to_hidden_states=True)
 
 
-def _wrap_with_ddp(block, pg_collection):
-    from megatron.training.training import wrap_model_chunks_with_ddp
-
-    ddp_config = DistributedDataParallelConfig(
+def _ddp_config():
+    return DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
         overlap_grad_reduce=True,
         use_distributed_optimizer=True,
@@ -278,38 +282,59 @@ def _wrap_with_ddp(block, pg_collection):
         # of the other layers, and the hook of a bucket's last gradient launches its reduction.
         bucket_size=8192,
     )
+
+
+def _wrap_with_ddp(block, pg_collection):
+    from megatron.training.training import wrap_model_chunks_with_ddp
+
     model = wrap_model_chunks_with_ddp(
         [block],
         TransformerConfig(num_attention_heads=1, num_layers=1),
-        ddp_config,
+        _ddp_config(),
         pg_collection=pg_collection,
     )[0]
     model.broadcast_params()
     return model
 
 
-def _build(engram_config, pg_collection, deterministic=False, batch_size=_BATCH, ddp=True):
+def _build(
+    engram_config,
+    pg_collection,
+    deterministic=False,
+    batch_size=_BATCH,
+    ddp=True,
+    train_embedding=True,
+):
     """The block of one Engram configuration, under DDP with overlapping gradient reduction
-    unless ``ddp`` is off."""
+    unless ``ddp`` is off, and with a frozen embedding unless ``train_embedding`` is on."""
     torch.manual_seed(1234)
     model = _Block(engram_config, pg_collection, deterministic, batch_size)
+    if not train_embedding:
+        # The output of a frozen embedding requires no gradient and is in no backward pass.
+        model.embedding.requires_grad_(False)
     if ddp:
         model = _wrap_with_ddp(model, pg_collection)
     model.train()
     return model
 
 
-def _build_pair(tmp_path, deterministic=False, batch_size=_BATCH, ddp=True, **engram_options):
+def _build_pair(
+    tmp_path,
+    deterministic=False,
+    batch_size=_BATCH,
+    ddp=True,
+    train_embedding=True,
+    **engram_options,
+):
     """The block twice, with the same parameters: without and with ``async_lookup``."""
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     asynchronous_config = _engram_config(tmp_path, async_lookup=True, **engram_options)
     # Collective, on every rank before a model is built, as in the model builder.
     initialize_engram_parallel_state(pg_collection, asynchronous_config)
     initialize_engram_lookup_groups(pg_collection, asynchronous_config)
-    inline = _build(
-        _engram_config(tmp_path, **engram_options), pg_collection, deterministic, batch_size, ddp
-    )
-    asynchronous = _build(asynchronous_config, pg_collection, deterministic, batch_size, ddp)
+    options = (pg_collection, deterministic, batch_size, ddp, train_embedding)
+    inline = _build(_engram_config(tmp_path, **engram_options), *options)
+    asynchronous = _build(asynchronous_config, *options)
     with torch.no_grad():
         for source, target in zip(inline.parameters(), asynchronous.parameters()):
             target.copy_(source)
@@ -361,7 +386,7 @@ def _run_step(
                     lookups = prefetch_engram_lookups([block.engram], input_ids, packed_seq_params)
                 hidden = block.embedding * 1.0
                 if asynchronous:
-                    join_lookup_stream_in_backward(hidden)
+                    join_lookup_stream_in_backward(hidden, lookups)
 
                 def run(hidden_states):
                     # What checkpointed_forward does with its layer_context: the binding is
@@ -417,6 +442,11 @@ def _compare_steps(models, tokens, monkeypatch, *, planned=True, recompute=False
     return result, reference, inline_groups, groups[first:], synchronizations
 
 
+def _engram(model):
+    """The Engram module of a wrapped block or model with one Engram layer."""
+    return next(module for module in model.modules() if isinstance(module, Engram))
+
+
 def _assert_all_to_alls(models, inline_groups, async_groups, *, planned, recompute):
     """The asynchronous step runs on the lookup communicator and replays no lookup.
 
@@ -425,7 +455,7 @@ def _assert_all_to_alls(models, inline_groups, async_groups, *, planned, recompu
     train. The asynchronous step exchanges the counts of a planned step once and looks every
     microbatch up once.
     """
-    inline, asynchronous = (model.module.engram for model in models)
+    inline, asynchronous = (_engram(model) for model in models)
     row_group = inline.embedding.ep_group
     lookup_group = asynchronous.lookup_group
     assert lookup_group is not None and lookup_group is not row_group
@@ -485,10 +515,21 @@ def test_async_lookup_matches_inline_bitwise_with_sharded_tables(
     )
 
 
+# Where the backward of a block waits for the lookup stream: at the output of a trained
+# embedding, or, with a frozen embedding, whose output is in no backward pass, right where the
+# backward of each lookup is launched.
+_JOINS = pytest.mark.parametrize(
+    "train_embedding", [True, False], ids=["join_at_embedding_output", "lookup_joins_own_backward"]
+)
+
+
 @_four_ranks
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("expert_parallel", [2], indirect=True)
-def test_table_gradients_are_complete_when_finish_grad_sync_returns(tmp_path, expert_parallel):
+@_JOINS
+def test_table_gradients_are_complete_when_finish_grad_sync_returns(
+    tmp_path, expert_parallel, train_embedding
+):
     """One owner per row: no collective orders the compute stream after the lookup stream.
 
     The replica group of the tables has a single rank, so DDP skips their reductions, and the
@@ -496,17 +537,19 @@ def test_table_gradients_are_complete_when_finish_grad_sync_returns(tmp_path, ex
     their buckets on the lookup stream, which is held back here, and from the second step on
     the hook of the last one finishes the buckets there. The compute stream reads complete
     gradients once ``finish_grad_sync`` returns only if it was made to wait for the lookup
-    stream. Two waits do that, and the case fails when both are missing: the join at the
-    embedding output (``join_lookup_stream_in_backward``), and the wait of
-    ``finish_grad_sync`` for the stream the tables name. The case cannot tell which of the
-    two is missing; the join alone is checked without DDP below.
+    stream. Two waits do that, and the case fails when both are missing: the join in the
+    backward (``join_lookup_stream_in_backward``), and the wait of ``finish_grad_sync`` for
+    the stream the tables name. The case cannot tell which of the two is missing; the join
+    alone is checked without DDP below.
 
     The gradients read early are compared, but that comparison alone passes without either
     wait on the devices it was tried on: the compute stream waits for the reductions of the
     other buckets, and the lookup stream gets through its work meanwhile. The recorded stream
     waits are what fails then.
     """
-    models = _build_pair(tmp_path, parallel_size=4, communication_backend="nccl")
+    models = _build_pair(
+        tmp_path, train_embedding=train_embedding, parallel_size=4, communication_backend="nccl"
+    )
     tokens = _token_batches()
     # The first step of a model reduces its buckets from finish_grad_sync, on the compute
     # stream; the hooks dispatch the reductions from the second step on.
@@ -535,7 +578,7 @@ def _table_gradients(block, input_ids, *, asynchronous, hold_lookup_stream=False
         lookups = prefetch_engram_lookups([block.engram], input_ids)
     hidden = block.embedding * 1.0
     if asynchronous:
-        join_lookup_stream_in_backward(hidden)
+        join_lookup_stream_in_backward(hidden, lookups)
     with use_prefetched_lookup(block, lookups):
         output = block.layers(hidden, input_ids)
     generator = torch.Generator(device=output.device).manual_seed(torch.distributed.get_rank())
@@ -554,17 +597,21 @@ def _table_gradients(block, input_ids, *, asynchronous, hold_lookup_stream=False
 
 @_multi_rank
 @pytest.mark.parametrize("expert_parallel", [2], indirect=True)
-def test_backward_waits_for_the_table_gradients_without_ddp(tmp_path, expert_parallel):
+@_JOINS
+def test_backward_waits_for_the_table_gradients_without_ddp(
+    tmp_path, expert_parallel, train_embedding
+):
     """The join is all that orders the compute stream after the table gradients.
 
     The blocks are not wrapped by DDP: nothing reduces their gradients, and no bucket group
     waits for the lookup stream. The table-gradient branch accumulates each table's ``.grad``
     on the lookup stream, behind the work that holds that stream back, and the backward of the
     block returns without autograd waiting for it. The gradients read on the compute stream
-    right then equal the inline block's only if the backward waited for the lookup stream at
-    the embedding output (``join_lookup_stream_in_backward``).
+    right then equal the inline block's only if the backward waited for the lookup stream
+    where ``join_lookup_stream_in_backward`` arranged it: at the embedding output, or in the
+    backward of the lookup itself (``EngramLookupHandle.joins_own_backward``).
     """
-    inline, asynchronous = _build_pair(tmp_path, ddp=False)
+    inline, asynchronous = _build_pair(tmp_path, ddp=False, train_embedding=train_embedding)
     input_ids = _token_batches()[0]
     # A first pass each: it creates the gradients that the measured pass accumulates into.
     _table_gradients(inline, input_ids, asynchronous=False)
@@ -717,6 +764,128 @@ def test_lookup_communicator_is_a_second_group_over_the_row_group(
         assert table.weight.grad_accumulation_stream == get_lookup_stream()
 
 
+# Four MLP layers, so the Engram lookups are the model's only all-to-alls; the memory is on
+# the second layer.
+_HYBRID_PATTERN = "----"
+
+
+def _build_hybrid_pair(tmp_path, *, recompute, mhc):
+    """A HybridModel with one Engram layer twice, with the same parameters: without and with
+    ``async_lookup``.
+
+    The model builder builds and wraps both under DDP, as a training run does; on the way it
+    creates the lookup communicators that the second model's Engram layer takes.
+    """
+    from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+
+    options = dict(
+        num_layers=len(_HYBRID_PATTERN),
+        hidden_size=_HIDDEN,
+        ffn_hidden_size=2 * _HIDDEN,
+        num_attention_heads=4,
+        bf16=_DTYPE == torch.bfloat16,
+        params_dtype=_DTYPE,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        add_bias_linear=False,
+        engram_enabled=True,
+        attention_backend=AttnBackend.local,
+    )
+    if recompute:
+        options.update(
+            recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1
+        )
+    if mhc:
+        options.update(enable_mhc_connections=True, mhc_num_residual_streams=4)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    models = []
+    for async_lookup in (False, True):
+        model_config = HybridModelConfig(
+            transformer=TransformerConfig(**options),
+            engram_config=_engram_config(tmp_path, async_lookup=async_lookup),
+            hybrid_layer_pattern=_HYBRID_PATTERN,
+            vocab_size=_VOCAB,
+            seq_length=_SEQ,
+        )
+        torch.manual_seed(4321)
+        model = HybridModelBuilder(model_config).build_distributed_models(
+            pg_collection, ddp_config=_ddp_config()
+        )[0]
+        model.train()
+        models.append(model)
+    inline, asynchronous = models
+    with torch.no_grad():
+        # Away from its initial value, so that every dense parameter gets a gradient.
+        _engram(inline).short_conv.weight.normal_(mean=0.0, std=0.05)
+        for source, target in zip(inline.parameters(), asynchronous.parameters()):
+            target.copy_(source)
+    return inline, asynchronous
+
+
+def _run_hybrid_step(model, token_batches, *, asynchronous):
+    """One step of a model of :func:`_build_hybrid_pair`, in the order a training step uses.
+
+    Returns the per-token losses of the microbatches and every trained parameter's reduced
+    gradient.
+    """
+    model.zero_grad_buffer()
+    if asynchronous:
+        plan_engram_lookups([model], token_batches)
+    position_ids = torch.arange(_SEQ, device=_device()).expand(_BATCH, -1)
+    losses = []
+    for index, input_ids in enumerate(token_batches):
+        last = index == len(token_batches) - 1
+        with nullcontext() if last else model.no_sync():
+            labels = torch.roll(input_ids, shifts=-1, dims=1)
+            loss = model(input_ids, position_ids, None, labels=labels)
+            generator = torch.Generator(device=loss.device).manual_seed(
+                1000 * index + torch.distributed.get_rank()
+            )
+            weights = torch.rand(loss.shape, generator=generator, device=loss.device)
+            (loss.float() * weights).sum().backward()
+            losses.append(loss.detach().clone())
+    model.finish_grad_sync()
+    torch.cuda.synchronize()
+    grads = {
+        name: param.main_grad.detach().clone()
+        for name, param in model.module.named_parameters()
+        if param.requires_grad
+    }
+    return losses, grads
+
+
+@_multi_rank
+@pytest.mark.parametrize("expert_parallel", [2], indirect=True)
+@pytest.mark.parametrize("mhc", [False, True], ids=["plain", "hyper_connections"])
+@pytest.mark.parametrize("recompute", [False, True], ids=["no_recompute", "full_recompute"])
+def test_hybrid_model_async_lookup_matches_inline_bitwise(
+    tmp_path, monkeypatch, expert_parallel, mhc, recompute
+):
+    """Through HybridModel: the lookups are issued before the embedding and handed to the
+    Engram layer by the stack, in the forward and in the recompute. Same losses and reduced
+    gradients as with the inline lookup, and one count exchange for the step.
+
+    The gradients are read after the host waited for every stream, so the case does not
+    depend on the model's join of the lookup stream. The stand-in cases of
+    test_hybrid_composition.py check that the model registers the join, and
+    ``test_backward_waits_for_the_table_gradients_without_ddp`` that the backward waits there.
+    """
+    models = _build_hybrid_pair(tmp_path, recompute=recompute, mhc=mhc)
+    tokens = _token_batches()
+    groups = _record_all_to_all_groups(monkeypatch)
+    # Each model runs one step before its measured one, for what a first step initializes.
+    for asynchronous, model in enumerate(models):
+        _run_hybrid_step(model, tokens, asynchronous=bool(asynchronous))
+    first = len(groups)
+    reference = _run_hybrid_step(models[0], tokens, asynchronous=False)
+    inline_groups, first = groups[first:], len(groups)
+    result = _run_hybrid_step(models[1], tokens, asynchronous=True)
+
+    _assert_same_step(result, reference)
+    assert any("embedding.tables" in name for name in result[1])
+    _assert_all_to_alls(models, inline_groups, groups[first:], planned=True, recompute=recompute)
+
+
 _CPU_SEQ = 24
 
 
@@ -745,18 +914,6 @@ def _cpu_inputs(batch_size=1):
     return tokens, hidden
 
 
-class _LookedUp:
-    """A stand-in for a handle whose lookup is complete: the fields of a lookup result."""
-
-    def __init__(self, result):
-        self._memory, self.valid, self.cu_seqlens = result
-        self.attached = 0
-
-    def attach(self):
-        self.attached += 1
-        return self._memory
-
-
 @pytest.mark.parametrize("wrapped", [False, True], ids=["layer", "hyper_connection_wrapper"])
 def test_forward_takes_the_lookup_bound_to_its_layer(tmp_path, wrapped):
     """Under ``use_prefetched_lookup`` the layer's module fuses the bound lookup and looks
@@ -770,7 +927,7 @@ def test_forward_takes_the_lookup_bound_to_its_layer(tmp_path, wrapped):
         qkv_format="thd", cu_seqlens_q=torch.tensor([0, 7, 19], dtype=torch.int32)
     )
     expected = module(hidden, tokens, packed_seq_params)
-    handle = _LookedUp(module.lookup(tokens, packed_seq_params))
+    handle = CompletedLookup(module.lookup(tokens, packed_seq_params))
     assert handle.valid is not None and handle.cu_seqlens is not None
     lookups = []
     table_lookup = module._lookup
@@ -985,6 +1142,24 @@ def test_prefetched_lookup_runs_its_backward_on_the_lookup_stream(tmp_path, comp
     assert handle.attach() is handle.memory
     with use_prefetched_lookup(SimpleNamespace(engram=module), {_ENGRAM_LAYER: handle}):
         assert torch.equal(module(hidden), expected)
+
+
+def test_lookup_joins_its_own_backward_without_a_tensor_to_join_at(tmp_path, compute_stream):
+    """A tensor that requires no gradient is in no backward pass. The stream that launches
+    the backward of a lookup then waits for it at once, right after the layer's own wait."""
+    module = _cpu_module(tmp_path, async_lookup=True)
+    tokens, hidden = _cpu_inputs()
+    hidden.requires_grad_(True)
+    lookups = prefetch_engram_lookups([module], tokens)
+    handle = lookups[_ENGRAM_LAYER]
+
+    join_lookup_stream_in_backward(torch.zeros(3), lookups)
+    with use_prefetched_lookup(SimpleNamespace(engram=module), lookups):
+        output = module(hidden)
+    assert compute_stream.waited_for == [handle.ready]
+    output.sum().backward()
+
+    assert compute_stream.waited_for == [handle.ready, get_lookup_stream()]
 
 
 class _Group:
