@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from unittest.mock import Mock, call, patch
 
@@ -472,6 +472,31 @@ class TestHybridModelBuilderBuildDistributedModels:
         result = self.builder.build_distributed_models(self.pg)
 
         assert result is model_list
+
+    @patch("megatron.training.models.hybrid.initialize_engram_transports")
+    @patch("megatron.training.models.hybrid.initialize_engram_lookup_groups")
+    @patch("megatron.training.models.hybrid.initialize_engram_parallel_state")
+    @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
+    def test_engram_groups_are_set_up_before_the_stages_are_built(
+        self, mock_unimodal, mock_table_groups, mock_lookup_groups, mock_transports
+    ):
+        # The lookup communicators span the row groups of the tables, and an Engram layer
+        # with async_lookup takes its communicator when it is built.
+        self.config.engram_config = engram_config = Mock()
+        mock_unimodal.return_value = [Mock()]
+        setup = Mock()
+        setup.attach_mock(mock_table_groups, "table_groups")
+        setup.attach_mock(mock_lookup_groups, "lookup_groups")
+        setup.attach_mock(mock_unimodal, "build_stages")
+
+        self.builder.build_distributed_models(self.pg)
+
+        assert [name for name, _, _ in setup.mock_calls] == [
+            "table_groups",
+            "lookup_groups",
+            "build_stages",
+        ]
+        mock_lookup_groups.assert_called_once_with(self.pg, engram_config)
 
     @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")

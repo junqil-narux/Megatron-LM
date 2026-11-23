@@ -7,9 +7,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
+from megatron.core.models.engram import EngramConfig
 from megatron.training import training as training_mod
-from megatron.training.models import T5ModelConfig
+from megatron.training.models import HybridModelConfig, T5ModelConfig
+from tests.unit_tests.models.engram._test_utils import write_tokenizer_map
 
 
 @pytest.fixture(autouse=True)
@@ -38,7 +41,16 @@ class _RerunThroughOptimizer(_Rerun):
 
 
 def _run(
-    *, args_overrides=None, model=None, optimizer=None, config=None, distillation=None, **kwargs
+    *,
+    args_overrides=None,
+    model=None,
+    optimizer=None,
+    config=None,
+    distillation=None,
+    data_iterator=None,
+    num_microbatches=1,
+    forward_backward_func=None,
+    **kwargs,
 ):
     args = SimpleNamespace(
         save_params_interval=None,
@@ -62,7 +74,7 @@ def _run(
         mock.patch.object(training_mod, "get_args", return_value=args),
         mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
         mock.patch.object(training_mod, "get_rerun_state_machine", return_value=_Rerun()),
-        mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
+        mock.patch.object(training_mod, "get_num_microbatches", return_value=num_microbatches),
         mock.patch.object(training_mod, "has_nvidia_modelopt", distillation is not None),
         mock.patch.object(
             training_mod,
@@ -76,12 +88,12 @@ def _run(
     ):
         result = training_mod.train_step(
             forward_step_func=lambda *a, **k: None,
-            data_iterator=iter([]),
+            data_iterator=iter([]) if data_iterator is None else data_iterator,
             model=model,
             optimizer=optimizer,
             opt_param_scheduler=None,
             config=config or SimpleNamespace(),
-            forward_backward_func=lambda **kw: captured.update(kw) or [],
+            forward_backward_func=forward_backward_func or (lambda **kw: captured.update(kw) or []),
             iteration=0,
             **kwargs,
         )
@@ -144,6 +156,91 @@ def test_distillation_shape_kwargs_remain_compatible_with_core(run_config):
 def test_train_step_defaults_to_none():
     captured = _run()
     assert captured["p2p_communicator"] is None and captured["pg_collection"] is None
+
+
+def _run_engram_step(run_config, tmp_path, *, async_lookup):
+    """A step of two microbatches for a hybrid model with an Engram memory, on one rank.
+
+    Returns the batches, the model, the stand-in of the lookup plan, and the events of the
+    step: the plan, then the token rows queued when the schedule starts and the batches the
+    schedule draws from its iterator.
+    """
+    transformer = run_config.model.transformer
+    transformer.engram_enabled = True
+    transformer.max_seq_length_per_sample = 4
+    run_config.model = HybridModelConfig(
+        transformer=transformer,
+        vocab_size=32,
+        engram_config=EngramConfig(
+            global_vocab_sizes=(17, 19),
+            layer_ids=(1,),
+            max_ngram_order=3,
+            num_hash_heads=2,
+            memory_dim=8,
+            kernel_size=4,
+            hash_seed=0,
+            boundary_token_id=0,
+            tokenizer_map_path=str(write_tokenizer_map(tmp_path / "map.json")),
+            async_lookup=async_lookup,
+        ),
+    )
+    batches = [{"tokens": 4 * index + torch.arange(4).view(1, 4), "id": index} for index in (0, 1)]
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False,
+            zero_grad_buffer=lambda: None,
+            # No pipeline or tensor parallel peers: the token rows are not distributed.
+            pg_collection=SimpleNamespace(pp=None, tp=None),
+        )
+    ]
+    events = []
+
+    def schedule(data_iterator, **kwargs):
+        events.append(("queued rows", len(data_iterator.peek_pipeline_tokens())))
+        events.extend(batch["id"] for batch in data_iterator)
+        return []
+
+    with mock.patch.object(
+        training_mod, "plan_engram_lookups", side_effect=lambda *args: events.append("plan")
+    ) as plan:
+        _run(
+            model=model,
+            data_iterator=iter(batches),
+            num_microbatches=len(batches),
+            forward_backward_func=schedule,
+        )
+    return batches, model, plan, events
+
+
+def test_train_step_plans_the_engram_lookups_of_a_step_before_the_schedule(run_config, tmp_path):
+    batches, model, plan, events = _run_engram_step(run_config, tmp_path, async_lookup=True)
+
+    # The plan sees the rows of every microbatch, and the schedule still draws every batch.
+    assert events == ["plan", ("queued rows", 2), 0, 1]
+    planned_model, planned_rows = plan.call_args.args
+    assert planned_model is model
+    assert len(planned_rows) == len(batches)
+    for row, batch in zip(planned_rows, batches):
+        assert torch.equal(row.cpu(), batch["tokens"])
+
+
+@pytest.mark.parametrize(
+    "async_lookup, rows_have_cu_seqlens",
+    [pytest.param(False, False, id="inline_lookup"), pytest.param(True, True, id="packed_rows")],
+)
+def test_train_step_plans_no_engram_lookup(
+    run_config, tmp_path, async_lookup, rows_have_cu_seqlens
+):
+    """Without the option the Engram layers look their rows up themselves. Rows with document
+    boundaries are hashed with the cu_seqlens of their batch, so their lookups cannot be
+    routed from the token rows ahead of the schedule. Neither reads the step ahead."""
+    with mock.patch.object(
+        type(run_config.data), "has_cu_seqlens", return_value=rows_have_cu_seqlens
+    ):
+        _, _, plan, events = _run_engram_step(run_config, tmp_path, async_lookup=async_lookup)
+
+    plan.assert_not_called()
+    assert events == [("queued rows", 0), 0, 1]
 
 
 def test_train_step_uses_optimizer_ddp_config_for_mxfp8_staging():

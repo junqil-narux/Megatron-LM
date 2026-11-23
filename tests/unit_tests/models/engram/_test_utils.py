@@ -92,6 +92,45 @@ def make_pg_collection(ep=None, tp=None, expt_dp=None, cp=None) -> ProcessGroupC
     return ProcessGroupCollection(ep=ep, tp=tp, expt_dp=expt_dp, cp=cp)
 
 
+class CompletedLookup:
+    """A stand-in for the handle of a lookup issued ahead, once the lookup is complete.
+
+    It carries the fields of the ``EngramLookupResult`` it is made from and counts how often
+    its memory is taken for a fusion.
+    """
+
+    def __init__(self, result):
+        self._memory, self.valid, self.cu_seqlens = result
+        self.attached = 0
+
+    def attach(self):
+        """Return the memory, as ``EngramLookupHandle.attach`` does after its wait."""
+        self.attached += 1
+        return self._memory
+
+
+@contextmanager
+def deterministic_algorithms(enabled: bool):
+    """Mirror --deterministic-mode, which turns on torch.use_deterministic_algorithms."""
+    previous = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(enabled)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous)
+
+
+@contextmanager
+def sync_debug_mode(mode: str):
+    """Make synchronizing CUDA calls warn (``"warn"``) or raise (``"error"``) in the block."""
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode(mode)
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+
+
 def _world_device() -> torch.device:
     if dist.get_backend() == "nccl":
         return torch.device("cuda", torch.cuda.current_device())

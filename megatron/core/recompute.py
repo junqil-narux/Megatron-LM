@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from contextlib import nullcontext
-from typing import List, Optional, Set, Tuple, Union
+from contextlib import AbstractContextManager, nullcontext
+from typing import Callable, List, Optional, Set, Tuple, Union
 
 from torch import Tensor
 
@@ -34,6 +34,7 @@ def checkpointed_forward(
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
+    layer_context: Optional[Callable[[MegatronModule], AbstractContextManager]] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -48,6 +49,9 @@ def checkpointed_forward(
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Boundary-layout token IDs for hash-routed MoE,
             Engram and custom layers.
+        layer_context (Callable, optional): Called with a layer, returns a context manager
+            that is entered around that layer's call: in the checkpointed forward and again
+            each time the layer is recomputed.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -159,7 +163,10 @@ def checkpointed_forward(
                     is_custom_layer or owns_engram or getattr(router, "is_hash_layer", False)
                 ):
                     layer_kwargs["input_ids"] = layer_input_ids
-                with inner_quantization_context:
+                with (
+                    inner_quantization_context,
+                    layer_context(layer) if layer_context is not None else nullcontext(),
+                ):
                     if is_custom_layer and not getattr(
                         layer, "supports_hybrid_recompute_kwargs", False
                     ):

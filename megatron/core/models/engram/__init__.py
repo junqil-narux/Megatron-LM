@@ -2,6 +2,7 @@
 
 """Hashed n-gram memory modules for Megatron Core (DeepSeek Engram and Qwen PLE)."""
 
+from .async_lookup import initialize_engram_lookup_groups, plan_engram_lookups
 from .config import EngramConfig
 from .engram import Engram, EngramLookupResult
 from .layer_specs import apply_engram_to_hybrid_stack_spec
@@ -17,7 +18,9 @@ __all__ = [
     "EngramVariant",
     "apply_engram_to_hybrid_stack_spec",
     "close_engram_transports",
+    "initialize_engram_lookup_groups",
     "initialize_engram_parallel_state",
     "initialize_engram_transports",
+    "plan_engram_lookups",
     "resolve_variant",
 ]

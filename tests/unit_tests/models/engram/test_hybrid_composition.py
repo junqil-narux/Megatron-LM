@@ -7,6 +7,8 @@ Transformer Engine modules; the integration tests replace the expensive layers w
 around the real TransformerLayer, HybridStack, HybridModel and hyper-connection wrapper paths.
 """
 
+from collections import deque
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -16,7 +18,7 @@ import torch
 import megatron.core.context_parallel.layout as cp_layout_module
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.models.engram import apply_engram_to_hybrid_stack_spec
+from megatron.core.models.engram import apply_engram_to_hybrid_stack_spec, async_lookup
 from megatron.core.models.engram.config import EngramConfig
 from megatron.core.models.engram.cp_layout import resolve_layer_cp_layout
 from megatron.core.models.engram.engram import Engram
@@ -26,9 +28,11 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec,
     wide_residual_hybrid_stack_spec,
 )
-from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel, _async_lookup_engram_modules
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import checkpointed_forward
+from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -36,6 +40,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 
+from ._test_utils import CompletedLookup, make_module_config, make_pg_collection
 from ._test_utils import packed_seq_params as tagged_packed_seq_params
 from ._test_utils import write_tokenizer_map
 
@@ -369,6 +374,80 @@ def test_hybrid_stack_passes_token_ids_to_engram_layers_only(monkeypatch, full_r
     assert "input_ids" not in plain_layer.calls[0]
 
 
+@pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+def test_checkpointed_forward_enters_the_layer_context_again_in_the_recompute(
+    monkeypatch, recompute_method
+):
+    """A layer's context wraps its call in the checkpointed forward, which runs without
+    gradients, and wraps it again when the backward recomputes the layer."""
+    if not torch.cuda.is_available():
+        # The checkpoint snapshots the CUDA generators; without a device, only the CPU one.
+        monkeypatch.setattr(
+            tensor_parallel_random, "_get_all_rng_states", lambda: (torch.get_rng_state(),)
+        )
+        monkeypatch.setattr(
+            tensor_parallel_random,
+            "_set_all_rng_states",
+            lambda cpu_rng_state, *others, **kind: torch.set_rng_state(cpu_rng_state),
+        )
+    events = []
+
+    class _DoublingLayer(_RecordingLayer):
+        def forward(self, hidden_states, **kwargs):
+            events.append(("call", self.layer_number, torch.is_grad_enabled()))
+            return 2.0 * hidden_states, None
+
+    @contextmanager
+    def layer_context(layer):
+        events.append(("enter", layer.layer_number, torch.is_grad_enabled()))
+        try:
+            yield
+        finally:
+            events.append(("exit", layer.layer_number, torch.is_grad_enabled()))
+
+    def around_call(layer_number, grad_enabled):
+        return [(event, layer_number, grad_enabled) for event in ("enter", "call", "exit")]
+
+    stack = _make_stack(
+        [_DoublingLayer(layer_number=layer_number) for layer_number in (1, 2, 3)],
+        Symbols.ATTENTION * 3,
+        recompute_granularity="full",
+        recompute_method=recompute_method,
+        recompute_num_layers=2,
+    )
+    hidden_states = torch.randn(4, 2, 8, requires_grad=True)
+
+    output = checkpointed_forward(
+        stack,
+        hidden_states=hidden_states,
+        attention_mask=None,
+        context=None,
+        context_mask=None,
+        rotary_pos_emb=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        use_inner_quantization_context=False,
+        layer_context=layer_context,
+    )
+    forward_events = list(events)
+    events.clear()
+    output.sum().backward()
+
+    if recompute_method == "uniform":
+        # Layers 1 and 2 share a checkpoint and layer 3 has its own, which is recomputed first.
+        assert forward_events == (
+            around_call(1, False) + around_call(2, False) + around_call(3, False)
+        )
+        assert events == around_call(3, True) + around_call(1, True) + around_call(2, True)
+    else:
+        # Layers 1 and 2 have a checkpoint each; layer 3 runs once, outside any checkpoint.
+        assert forward_events == (
+            around_call(1, False) + around_call(2, False) + around_call(3, True)
+        )
+        assert events == around_call(2, True) + around_call(1, True)
+    assert torch.equal(hidden_states.grad, torch.full_like(hidden_states, 8.0))
+
+
 @pytest.mark.parametrize("tp_rank", [0, 1])
 def test_moe_unflatten_takes_the_local_slice_of_unscattered_engram_ids(monkeypatch, tp_rank):
     """An Engram-owning MoE layer under sequence parallelism gets the token IDs unscattered (the
@@ -522,6 +601,116 @@ def test_mhc_wrapper_without_memory_keeps_the_inner_kwargs():
     assert "skip_engram" not in inner_layer.calls[0]
 
 
+class _MemoryLayer(_RecordingLayer):
+    """TransformerLayer stand-in that adds its Engram memory through the real layer entry."""
+
+    def forward(self, hidden_states, **kwargs):
+        self.calls.append(kwargs)
+        if not kwargs.get("skip_engram", False):
+            hidden_states = self._maybe_apply_engram(
+                hidden_states, kwargs.get("input_ids"), kwargs.get("packed_seq_params")
+            )
+        return 1.5 * hidden_states, None
+
+
+def _memory_stack(tmp_path, wrapped, **config_overrides):
+    """A stack of three stand-in layers; the first and the third hold a real Engram module."""
+    engram_config = _engram_config(tmp_path, layer_ids=(1, 3))
+    layers = []
+    for layer_number in (1, 2, 3):
+        engram = None
+        if layer_number in engram_config.layer_ids:
+            torch.manual_seed(layer_number)
+            engram = Engram(make_module_config(), engram_config, layer_number, make_pg_collection())
+            with torch.no_grad():
+                # Away from its initial value, so that every dense parameter gets a gradient.
+                engram.short_conv.weight.normal_(mean=0.0, std=0.05)
+        layer = _MemoryLayer(layer_number, engram=engram)
+        if wrapped:
+            # With neither attention nor MLP the wrapper calls the inner layer as a whole.
+            layer.self_attention = IdentityOp()
+            layer.cross_attention = IdentityOp()
+            layer.mlp = IdentityOp()
+            layer = _wrap_with_passthrough_mhc(layer)
+        layers.append(layer)
+    return _make_stack(layers, Symbols.ATTENTION * 3, **config_overrides)
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["layer", "hyper_connection_wrapper"])
+@pytest.mark.parametrize("full_recompute", [False, True], ids=["no_recompute", "full_recompute"])
+def test_hybrid_stack_hands_a_lookup_issued_ahead_to_its_layer(
+    tmp_path, monkeypatch, full_recompute, wrapped
+):
+    """The layer of a lookup issued ahead fuses that lookup, in its forward and again when it
+    is recomputed, and looks nothing up; a layer without one looks its rows up as before."""
+    if not torch.cuda.is_available():
+        # The checkpoint snapshots the CUDA generators; without a device, only the CPU one.
+        monkeypatch.setattr(
+            tensor_parallel_random, "_get_all_rng_states", lambda: (torch.get_rng_state(),)
+        )
+        monkeypatch.setattr(
+            tensor_parallel_random,
+            "_set_all_rng_states",
+            lambda cpu_rng_state, *others, **kind: torch.set_rng_state(cpu_rng_state),
+        )
+    recompute = (
+        dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=2)
+        if full_recompute
+        else {}
+    )
+    stack = _memory_stack(tmp_path, wrapped, **recompute)
+    first, third = (
+        getattr(layer, "inner_layer", layer).engram for layer in (stack.layers[0], stack.layers[2])
+    )
+    generator = torch.Generator().manual_seed(11)
+    input_ids = torch.randint(0, 16, (2, 24), generator=generator)
+    hidden_states = torch.randn(24, 2, 8, generator=generator, dtype=torch.float64)
+    hidden_states.requires_grad_(True)
+    table_lookups = []
+    for module in (first, third):
+        monkeypatch.setattr(
+            module,
+            "_lookup",
+            lambda hash_ids, layer_number=module.layer_number, lookup=module._lookup: (
+                table_lookups.append(layer_number) or lookup(hash_ids)
+            ),
+        )
+
+    def step(engram_lookups=None):
+        output = HybridStack.forward(
+            stack,
+            hidden_states=hidden_states,
+            attention_mask=None,
+            input_ids=input_ids,
+            engram_lookups=engram_lookups,
+        )
+        output.square().sum().backward()
+        gradients = {"hidden_states": hidden_states.grad.clone()}
+        for name, parameter in stack.named_parameters():
+            gradients[name] = parameter.grad.clone()
+        hidden_states.grad = None
+        stack.zero_grad()
+        return output.detach(), gradients
+
+    # Inline, a layer looks its rows up in every forward, and its recompute is one more.
+    forwards = 2 if full_recompute else 1
+    expected_output, expected_gradients = step()
+    assert sorted(table_lookups) == [1] * forwards + [3] * forwards
+
+    handle = CompletedLookup(first.lookup(input_ids))
+    table_lookups.clear()
+    output, gradients = step({1: handle})
+
+    assert table_lookups == [3] * forwards
+    assert handle.attached == forwards
+    assert first.prefetched_lookup is None
+    assert torch.equal(output, expected_output)
+    assert gradients.keys() == expected_gradients.keys()
+    assert any("embedding.tables" in name for name in gradients)
+    for name, gradient in gradients.items():
+        assert torch.equal(gradient, expected_gradients[name]), name
+
+
 class _RecordingDecoder:
     def __init__(self):
         self.kwargs = None
@@ -595,6 +784,129 @@ def test_hybrid_model_rejects_unsupported_engram_inputs_on_every_stage():
             inference_context=SimpleNamespace(),
             **forward_kwargs,
         )
+
+
+class _MemoryLookedUpAhead:
+    """Engram stand-in for a model that issues its lookups ahead: it records each lookup."""
+
+    def __init__(self, layer_number, events):
+        self.layer_number = layer_number
+        self.planned_routes = deque()
+        self._events = events
+
+    def prefetch(self, input_ids, packed_seq_params=None, route=None):
+        self._events.append(("lookup", self.layer_number, torch.is_grad_enabled()))
+        return SimpleNamespace(
+            input_ids=input_ids, packed_seq_params=packed_seq_params, joins_own_backward=False
+        )
+
+
+def _hybrid_model_stub_with_async_lookup(events, *, training=True, embedding_trains=True):
+    """The first-stage stub with two memories whose lookups are issued ahead, and an embedding
+    stand-in. ``events`` receives the lookups and the embedding call in the order they run."""
+    model = _hybrid_model_stub()
+    model.training = training
+    model._async_lookup_engram_modules = [
+        _MemoryLookedUpAhead(layer_number, events) for layer_number in (1, 3)
+    ]
+    weight = torch.randn(4, 2, 8, requires_grad=embedding_trains)
+
+    def embedding(input_ids, position_ids):
+        events.append("embedding")
+        return 2.0 * weight
+
+    model.embedding = embedding
+    return model
+
+
+def _forward_from_token_ids(model, packed_seq_params=None):
+    input_ids = torch.arange(8).view(2, 4)
+    HybridModel.forward(
+        model,
+        input_ids=input_ids,
+        position_ids=torch.arange(4).repeat(2, 1),
+        attention_mask=None,
+        packed_seq_params=packed_seq_params,
+    )
+    return input_ids
+
+
+@pytest.mark.parametrize("freeze_base_model_for_mtp", [False, True])
+def test_hybrid_model_issues_the_engram_lookups_ahead_of_the_embedding(
+    monkeypatch, freeze_base_model_for_mtp
+):
+    """A training forward issues every lookup before the embedding, in the grad mode the
+    decoder runs in, and hands the lookups to the decoder; its backward makes the stream wait
+    for the lookup stream at the embedding output."""
+    events = []
+    model = _hybrid_model_stub_with_async_lookup(events)
+    model.config.freeze_base_model_for_mtp = freeze_base_model_for_mtp
+    packed_seq_params = SimpleNamespace()
+
+    input_ids = _forward_from_token_ids(model, packed_seq_params)
+
+    decoder_runs_with_grad = not freeze_base_model_for_mtp
+    assert events == [
+        ("lookup", 1, decoder_runs_with_grad),
+        ("lookup", 3, decoder_runs_with_grad),
+        "embedding",
+    ]
+    lookups = model.decoder.kwargs["engram_lookups"]
+    assert list(lookups) == [1, 3]
+    for handle in lookups.values():
+        assert handle.input_ids is input_ids
+        assert handle.packed_seq_params is packed_seq_params
+        assert not handle.joins_own_backward
+
+    waited_for = []
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda: SimpleNamespace(wait_stream=waited_for.append)
+    )
+    monkeypatch.setattr(async_lookup, "get_lookup_stream", lambda: "lookup stream")
+    model.decoder.kwargs["hidden_states"].sum().backward()
+    assert waited_for == ["lookup stream"]
+
+
+def test_hybrid_model_issues_no_engram_lookup_ahead_in_evaluation():
+    events = []
+    model = _hybrid_model_stub_with_async_lookup(events, training=False)
+
+    _forward_from_token_ids(model)
+
+    assert events == ["embedding"]
+    # The decoder keeps its kwarg set, and its Engram layers look their rows up themselves.
+    assert "engram_lookups" not in model.decoder.kwargs
+
+
+def test_engram_lookups_join_their_own_backward_without_a_trained_embedding():
+    """An embedding output that requires no gradient is in no backward pass, so there is no
+    point after the Engram layers at which the backward could wait for the lookup stream."""
+    model = _hybrid_model_stub_with_async_lookup([], embedding_trains=False)
+
+    _forward_from_token_ids(model)
+
+    lookups = model.decoder.kwargs["engram_lookups"]
+    assert len(lookups) == 2
+    assert all(handle.joins_own_backward for handle in lookups.values())
+
+
+def test_async_lookup_engram_layers_must_share_the_stage_of_the_embedding():
+    def layer(layer_number, async_lookup):
+        engram_config = SimpleNamespace(async_lookup=async_lookup)
+        return SimpleNamespace(
+            engram=SimpleNamespace(layer_number=layer_number, engram_config=engram_config)
+        )
+
+    # A layer without a memory, one with it, and a hyper-connection wrapper around one.
+    layers = [SimpleNamespace(), layer(2, True), SimpleNamespace(inner_layer=layer(3, True))]
+    engram_modules = _async_lookup_engram_modules(layers, pre_process=True)
+    assert [engram.layer_number for engram in engram_modules] == [2, 3]
+    with pytest.raises(
+        ValueError, match=r"non-embedding stage contains Engram layer\(s\) \[2, 3\]"
+    ):
+        _async_lookup_engram_modules(layers, pre_process=False)
+    # A memory that is looked up inside its layer may sit on any stage.
+    assert _async_lookup_engram_modules([layer(2, False)], pre_process=False) == []
 
 
 def _hybrid_model(monkeypatch, config, **kwargs):

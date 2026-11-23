@@ -400,3 +400,68 @@ def test_zigzag_cp_lookup_holds_the_rows_of_each_rank(tmp_path, monkeypatch, lay
         assert not torch.equal(
             result.memory, select_contiguous(reference.memory, cp_size, cp_rank, 0)
         )
+
+
+@pytest.mark.parametrize("layout", ["unpacked", "packed"])
+@pytest.mark.parametrize("cp_layout", ["contiguous", "zigzag"])
+def test_lookup_steps_take_the_restored_row_without_a_token_gather(
+    tmp_path, monkeypatch, cp_layout, layout
+):
+    """The hashing and table-lookup steps of ``lookup``, run on the row the gather restores.
+
+    A caller that already holds that row hashes it without the context-parallel collective: the
+    hashing step then only selects this rank's positions, in the layer's layout, and the two
+    steps give what ``lookup`` gives for this rank's shard of the row.
+    """
+    from megatron.core.models.engram.cp_layout import thd_partition_index
+
+    _patch_groups(monkeypatch)
+    cp_size = 2
+    batch_size = 2 if layout == "unpacked" else 1
+    tokens, _ = _inputs(batch_size=batch_size)
+    packed_seq_params = row_cu_seqlens = None
+    if layout == "packed":
+        # The contiguous layout splits a row whose last document ends before the row does; the
+        # per-document zigzag splits the documents, which then fill the row.
+        document_ends = (7, _SEQUENCE - 5) if cp_layout == "contiguous" else (8, _SEQUENCE)
+        row_cu_seqlens = torch.tensor([0, *document_ends], dtype=torch.int32)
+        packed_seq_params = tagged_packed_seq_params(
+            qkv_format="thd", cu_seqlens_q=row_cu_seqlens, cp_partition_mode=cp_layout
+        )
+
+    def shard(cp_rank):
+        if cp_layout == "contiguous":
+            return select_contiguous(tokens, cp_size, cp_rank, 1)
+        if row_cu_seqlens is None:
+            return select_zigzag(tokens, cp_size, cp_rank, 1)
+        return tokens.index_select(1, thd_partition_index(row_cu_seqlens, cp_size, cp_rank))
+
+    gathers = []
+
+    def all_gather(parts, tensor, group):
+        gathers.append(group)
+        for rank, part in enumerate(parts):
+            part.copy_(shard(rank))
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    for cp_rank in range(cp_size):
+        module = _module(
+            tmp_path,
+            cp_group=_Group(cp_size, cp_rank),
+            cp_layout="contiguous" if cp_layout == "contiguous" else None,
+        )
+        assert module.cp_layout == cp_layout
+        result = module.lookup(shard(cp_rank), packed_seq_params)
+        assert len(gathers) == 1
+
+        local_sequence_length = module._local_sequence_length(_SEQUENCE // cp_size)
+        hash_ids, valid = module._hash_ids(
+            tokens, row_cu_seqlens, None, local_sequence_length, input_is_global=True
+        )
+        assert len(gathers) == 1
+        assert torch.equal(module._lookup_memory(hash_ids), result.memory)
+        if layout == "packed":
+            assert torch.equal(valid, result.valid)
+        else:
+            assert valid is None and result.valid is None
+        gathers.clear()

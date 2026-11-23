@@ -343,6 +343,18 @@ class EngramConfig:
     """Size in MiB of the workspace window the symmetric transport of each row group registers on
     every rank: the staging and receive slots of its exchanges and their completion flags."""
 
+    async_lookup: bool = False
+    """Issue the lookups of a training microbatch before the embedding instead of inside the
+    memory layers, on a CUDA stream and an NCCL communicator of their own over the row group, so
+    that they overlap the embedding and the layers in front of each memory layer. The request
+    counts of all microbatches of a step are exchanged once at its start, except for rows that
+    carry document boundaries, which exchange theirs per microbatch. A full recompute replays
+    the fusion without the lookup, and the lookup's backward runs off the compute stream.
+    Outputs and gradients equal the inline lookup's bit for bit; evaluation keeps the inline
+    lookup. Requires the 'nccl' communication backend and every memory layer on the pipeline
+    stage (and virtual pipeline chunk) that holds the embedding, which validate_startup checks
+    against the hybrid layer pattern."""
+
     variant_spec: EngramVariant = field(init=False, repr=False)
     """Conventions of the selected variant, resolved from variant."""
 
@@ -411,6 +423,7 @@ class EngramConfig:
             parallel_size=getattr(args, "engram_parallel_size", None),
             communication_backend=getattr(args, "engram_communication_backend", None),
             symmetric_workspace_mb=getattr(args, "engram_symmetric_workspace_mb", 64),
+            async_lookup=getattr(args, "engram_async_lookup", False),
         )
         packed_sequences = _validate_packed_sequence_args(args)
         config.validate_startup(
@@ -559,6 +572,12 @@ class EngramConfig:
                 "engram_communication_backend='symmetric' reads the tables through CUDA device "
                 "windows and needs CUDA; use 'nccl' without it."
             )
+        if self.async_lookup:
+            raise ValueError(
+                "engram_async_lookup requires engram_communication_backend='nccl': only the NCCL "
+                "all-to-all lookup can be issued ahead of the memory layers, and the symmetric "
+                "transport (the default with engram_parallel_size above 1) cannot."
+            )
 
     def _load_tokenizer_map(self) -> None:
         path = Path(self.tokenizer_map_path)
@@ -670,6 +689,7 @@ class EngramConfig:
                 with it the context-parallel layout, of every layer that carries a memory.
         """
         self._validate_layer_placement(transformer_config)
+        self._validate_async_lookup_placement(transformer_config, hybrid_layer_pattern)
         if expected_tokenizer_vocab_size is not None:
             self.validate_vocabulary(expected_tokenizer_vocab_size)
         self._validate_parallelism(
@@ -683,6 +703,55 @@ class EngramConfig:
             raise ValueError(
                 "engram_layer_ids must fall within the model's 1-based layer range "
                 f"[1, {transformer_config.num_layers}]; got {self.layer_ids}."
+            )
+
+    def _validate_async_lookup_placement(
+        self, transformer_config: Any, hybrid_layer_pattern: str | None
+    ) -> None:
+        """Reject memory layers outside the model chunk that holds the embedding.
+
+        async_lookup issues the lookups where the token IDs enter the model, in front of the
+        embedding, so every memory layer must be in the embedding's chunk: the first pipeline
+        stage and, under virtual pipeline parallelism, its first chunk. The model raises for
+        such a layer too, but only on the ranks that build its chunk, after collectives the
+        other ranks have joined. This check depends on the configuration alone, so every rank
+        raises here, before the Engram groups or any model exist. It needs the pattern: a model
+        described by a layer config list is checked when its chunks are built.
+        """
+        if not self.async_lookup or hybrid_layer_pattern is None:
+            return
+        # Imported here, as in _memory_layer_cp_layouts. The chunk is the one the hybrid model
+        # builds with pipeline rank 0 and the first virtual stage.
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            locate_pipeline_segment,
+            parse_hybrid_pattern,
+        )
+
+        pipeline_size = transformer_config.pipeline_model_parallel_size
+        embedding_chunk, layer_offset, _ = locate_pipeline_segment(
+            parse_hybrid_pattern(hybrid_layer_pattern).main_pattern or "",
+            pp_rank=0,
+            pp_size=pipeline_size,
+            vp_stage=None,
+            first_stage_layers=getattr(
+                transformer_config, "num_layers_in_first_pipeline_stage", None
+            ),
+            last_stage_layers=getattr(
+                transformer_config, "num_layers_in_last_pipeline_stage", None
+            ),
+        )
+        num_embedding_chunk_layers = layer_offset + len(embedding_chunk)
+        misplaced = [
+            layer_id for layer_id in self.layer_ids if layer_id > num_embedding_chunk_layers
+        ]
+        if misplaced:
+            raise ValueError(
+                "engram_async_lookup issues the lookups in front of the embedding, so every "
+                "memory layer must be on the pipeline stage and virtual pipeline chunk that "
+                f"holds the embedding: the first {num_embedding_chunk_layers} layer(s) of "
+                f"hybrid_layer_pattern {hybrid_layer_pattern!r} with "
+                f"pipeline_model_parallel_size={pipeline_size}. engram_layer_ids {misplaced} "
+                "are on later stages or chunks."
             )
 
     def validate_vocabulary(self, expected_tokenizer_vocab_size: int) -> None:

@@ -66,7 +66,7 @@ from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.models.engram import close_engram_transports
+from megatron.core.models.engram import close_engram_transports, plan_engram_lookups
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -3277,6 +3277,16 @@ def train_step(
             # the RerunDataIterator that the rerun state machine expects. (Engram rejects the
             # sequence-packing scheduler, so data_iterator is the schedule's iterator here.)
             engram_pg_collection = _get_model_pg_collection(model[0])
+            # Asynchronous lookups: route the lookups of all the step's microbatches and
+            # exchange their request counts once, before the schedule starts. Rows with
+            # document boundaries are hashed with their cu_seqlens, which only get_batch
+            # produces, so their lookups exchange the counts per microbatch instead.
+            engram_config = getattr(cfg.model, "engram_config", None)
+            plan_engram_lookups_this_step = (
+                engram_config is not None
+                and engram_config.async_lookup
+                and not cfg.data.has_cu_seqlens()
+            )
             forward_backward_data_iterator = prepare_tokens_for_pipeline(
                 data_iterator,
                 scheduled_num_microbatches,
@@ -3284,7 +3294,16 @@ def train_step(
                 sequence_length,
                 engram_pg_collection.pp,
                 engram_pg_collection.tp,
+                prefetch_all=plan_engram_lookups_this_step,
             )
+            if plan_engram_lookups_this_step:
+                # Under virtual pipeline parallelism every chunk's wrapper holds the same rows.
+                token_iterator = (
+                    forward_backward_data_iterator[0]
+                    if isinstance(forward_backward_data_iterator, list)
+                    else forward_backward_data_iterator
+                )
+                plan_engram_lookups(model, token_iterator.peek_pipeline_tokens())
 
         # Forward pass.
         if save_activations_in_this_iteration:

@@ -113,6 +113,27 @@ def _validate_hash_moe_pipeline_placement(
         )
 
 
+def _async_lookup_engram_modules(layers: Sequence[torch.nn.Module], pre_process: bool) -> list:
+    """Return the Engram modules of ``layers`` built with ``EngramConfig.async_lookup``.
+
+    Their lookups are issued where the token IDs enter the model, ahead of the embedding, so a
+    stage that owns one of them must own the embedding too.
+    """
+    from megatron.core.models.engram.async_lookup import local_engram_modules
+
+    engram_modules = [
+        engram for engram in local_engram_modules(layers) if engram.engram_config.async_lookup
+    ]
+    if engram_modules and not pre_process:
+        raise ValueError(
+            "The asynchronous Engram lookup is issued before the embedding, so all Engram "
+            "layers must be in the same pipeline/virtual-pipeline stage as the embedding. This "
+            "non-embedding stage contains Engram layer(s) "
+            f"{[engram.layer_number for engram in engram_modules]}."
+        )
+    return engram_modules
+
+
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -595,6 +616,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hash_moe_layer_threshold=hash_moe_layer_threshold or None,
             name="decoder",
         )
+        # The Engram modules whose lookups forward() issues ahead of the embedding.
+        self._async_lookup_engram_modules = (
+            _async_lookup_engram_modules(self.decoder.layers, self.pre_process)
+            if self.config.engram_enabled
+            else []
+        )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
@@ -794,11 +821,31 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             assert runtime_gather_output, "Inference must always gather TP logits"
 
         use_precomputed_mtp_embeddings = decoder_input is not None
+        engram_enabled = getattr(self.config, "engram_enabled", False)
 
         # Decoder embedding.
+        engram_lookups = None
         if decoder_input is not None:
             pass
         elif self.pre_process:
+            if (
+                engram_enabled
+                and self._async_lookup_engram_modules
+                and self.training
+                and inference_context is None
+                and not in_inference_mode
+            ):
+                # The memory of an Engram layer depends only on the token IDs. Issue the
+                # asynchronous lookups here, so that they run during the embedding and the
+                # layers in front of the Engram layers. Evaluation looks the rows up inline.
+                from megatron.core.models.engram.async_lookup import prefetch_engram_lookups
+
+                # In the grad mode of the decoder, whose Engram layers consume the lookups.
+                with torch.no_grad() if self.config.freeze_base_model_for_mtp else nullcontext():
+                    engram_lookups = prefetch_engram_lookups(
+                        self._async_lookup_engram_modules, input_ids, packed_seq_params
+                    )
+
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
             if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
@@ -807,6 +854,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
                     decoder_input, group=self.pg_collection.tp
                 )
+
+            if engram_lookups:
+                # Each Engram layer's backward launches its table gradients on the lookup
+                # stream. The backward reaches the embedding output after all of them.
+                from megatron.core.models.engram.async_lookup import join_lookup_stream_in_backward
+
+                join_lookup_stream_in_backward(decoder_input, engram_lookups)
 
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations. Under sequence
@@ -833,7 +887,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Engram also consumes the token IDs, but unsharded: it hashes the full row and slices
         # the hashes for sequence parallelism itself (its combination with hash routing or
         # custom layers under SP is rejected in __init__).
-        engram_enabled = getattr(self.config, "engram_enabled", False)
         hash_input_ids = None
         if self.config.moe_num_hash_layers > 0 or self._has_custom_layers or engram_enabled:
             hash_input_ids = input_ids
@@ -963,6 +1016,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
+                # Only a forward that issued Engram lookups ahead hands them to the decoder.
+                **({"engram_lookups": engram_lookups} if engram_lookups else {}),
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output

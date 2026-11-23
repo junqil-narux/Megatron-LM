@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import signal
 import sys
@@ -498,6 +498,87 @@ def test_engram_rejects_unsupported_training_features(monkeypatch, flags, error)
     args = _parse_training_args(monkeypatch, f'{_ENGRAM_FLAGS} {flags}')
     with pytest.raises(AssertionError, match=error):
         validate_args(args)
+
+
+@pytest.mark.parametrize(
+    'layout',
+    [
+        '--expert-model-parallel-size 2',
+        # The sharded layout takes the flag with its NCCL lookup.
+        '--engram-parallel-size 4 --use-distributed-optimizer --engram-communication-backend nccl',
+    ],
+    ids=['expert_parallel', 'sharded_nccl'],
+)
+def test_engram_async_lookup_reaches_engram_config(monkeypatch, layout):
+    """--engram-async-lookup passes validation with the NCCL lookup and sets the config field."""
+    monkeypatch.setenv('WORLD_SIZE', '4')
+    for flag, expected in (('', False), ('--engram-async-lookup', True)):
+        args = _parse_training_args(monkeypatch, f'{_ENGRAM_FLAGS} {layout} {flag}')
+        validate_args(args)
+        engram_config = EngramConfig.from_args(args, core_transformer_config_from_args(args))
+        assert engram_config.async_lookup is expected
+
+
+@pytest.mark.parametrize(
+    ('flags', 'error'),
+    [
+        ('', 'requires Engram'),
+        # The sharded layout looks its rows up with the symmetric transport unless told otherwise.
+        (
+            f'{_ENGRAM_FLAGS} --engram-parallel-size 4 --use-distributed-optimizer',
+            'requires --engram-communication-backend nccl',
+        ),
+        (f'{_ENGRAM_FLAGS} --fake-process-group', 'fake process group'),
+    ],
+    ids=['no_engram', 'symmetric_backend', 'fake_process_group'],
+)
+def test_engram_async_lookup_rejects_unsupported_setups(monkeypatch, flags, error):
+    # A 4-rank run that meets what the symmetric transport asks for, which is checked first.
+    monkeypatch.setenv('WORLD_SIZE', '4')
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setenv('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+    validate_args(_parse_training_args(monkeypatch, flags))
+    args = _parse_training_args(monkeypatch, f'{flags} --engram-async-lookup')
+    with pytest.raises(AssertionError, match=error):
+        validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ('pattern', 'misplaced_layer_id'),
+    # The third layer is on the second pipeline stage, or on the second virtual chunk of the
+    # first one.
+    [('**|**', 3), ('*|*|*|*', 3)],
+    ids=['pipeline_stage', 'virtual_pipeline_chunk'],
+)
+def test_engram_async_lookup_needs_engram_on_the_embedding_chunk(
+    monkeypatch, pattern, misplaced_layer_id
+):
+    """Every rank rejects an Engram layer outside the embedding's chunk from its arguments."""
+    monkeypatch.setenv('WORLD_SIZE', '4')
+    flags = (
+        f'{_ENGRAM_FLAGS} --expert-model-parallel-size 2 --pipeline-model-parallel-size 2 '
+        f'--hybrid-layer-pattern {pattern}'
+    )
+
+    def engram_config(layer_id, flag='--engram-async-lookup'):
+        args = _parse_training_args(monkeypatch, f'{flags} --engram-layer-ids {layer_id} {flag}')
+        validate_args(args)
+        return EngramConfig.from_args(args, core_transformer_config_from_args(args))
+
+    assert engram_config(1).async_lookup
+    assert engram_config(misplaced_layer_id, flag='').layer_ids == (misplaced_layer_id,)
+    with pytest.raises(ValueError, match='memory layer must be on the pipeline stage'):
+        engram_config(misplaced_layer_id)
+
+
+def test_legacy_hybrid_builder_rejects_engram_async_lookup():
+    from hybrid_builders import hybrid_builder
+
+    args = SimpleNamespace(
+        dynamic_context_parallel=False, engram_parallel_size=None, engram_async_lookup=True
+    )
+    with pytest.raises(NotImplementedError, match='--engram-async-lookup'):
+        hybrid_builder(args, pre_process=True, post_process=True)
 
 
 @dataclass

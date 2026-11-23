@@ -111,6 +111,7 @@ Engram is enabled by `--engram-vocab-sizes`.
 | `--engram-parallel-size` | – | Use the DP x CP layout with row groups of this many ranks |
 | `--engram-communication-backend` | see below | `symmetric` or `nccl` |
 | `--engram-symmetric-workspace-mb` | 64 | Workspace of the symmetric transport, per rank |
+| `--engram-async-lookup` | off | Look the rows up ahead of the Engram layers in training, on a CUDA stream and a communicator of their own (`nccl` backend only); see [Asynchronous lookup](#asynchronous-lookup) |
 
 Layer IDs follow `--hybrid-layer-pattern` with the pipeline separators (`|`) removed, so the
 same IDs work for any pipeline split. A selected layer must be a transformer layer (attention,
@@ -233,6 +234,18 @@ channel. The `nccl` cost is mostly peer-to-peer buffers that the first all-to-al
 depends on the number of NVLink peers and on the number of channels NCCL gives each peer, which
 is smaller in larger groups. Peers in another NVLink domain use shared network pools instead.
 
+`--engram-async-lookup` adds memory in two places. Neither has been measured.
+
+- A second NCCL communicator over each row group of more than one rank. Its buffers come on top
+  of the `nccl` figures above. Every rank creates the process group, but NCCL sets a
+  communicator up at the first collective of a group, and only the ranks of the first pipeline
+  stage, which holds the embedding, run one. Later pipeline stages hold no second communicator.
+- Reserved PyTorch memory. The looked-up rows, the all-to-all buffers and, when the tables
+  train, the dense table gradient of the lookup's backward are allocated on the lookup stream.
+  PyTorch's caching allocator reuses a freed block only on the stream that allocated it, so the
+  compute stream cannot reuse these blocks. Reserved memory grows by up to about the size of
+  the largest of them, which for trained tables is the dense gradient of one table shard.
+
 ## Known issue: cross-node all-to-all with the SPCX network plugin
 
 The `nccl` backend sends all-to-alls with uneven splits across nodes. The SPCX network plugin
@@ -303,8 +316,9 @@ The tables' optimizer state follows the checkpoint format:
   width (`--max-seq-length-per-sample` when it is set, `--seq-length` otherwise).
   `--dataloader-inter-document-masking` with context parallelism requires `--sft`.
 - Activation recomputation replays the memory from the token IDs, on every rank of a row group
-  together. A model that calls the module itself can replay the fusion alone, see
-  [Lookup ahead of the fusion](#lookup-ahead-of-the-fusion).
+  together. With `--engram-async-lookup`, full recomputation replays the fusion alone, see
+  [Asynchronous lookup](#asynchronous-lookup). A model that calls the module itself can do the
+  same, see [Lookup ahead of the fusion](#lookup-ahead-of-the-fusion).
 - CUDA graphs: only Transformer Engine per-layer capture restricted to the MoE scopes
   (`--cuda-graph-modules moe`, `moe_router` or `moe_preprocess`) is supported, and the memory
   must then sit on a non-MoE layer. The lookup has data-dependent shapes and always runs eagerly.
@@ -338,6 +352,66 @@ in its context-parallel layout.
   fusion only, and returns the gradient of the rows to the one lookup made outside it.
 - The lookup has data-dependent shapes and must not run while a CUDA graph is captured.
 
+## Asynchronous lookup
+
+The memory of an Engram layer depends only on the token IDs; only the fusion reads the hidden
+states. With `--engram-async-lookup`, training looks the rows up ahead of the Engram layers, on
+a CUDA stream and an NCCL communicator of their own, while the embedding and the layers in front
+of the Engram layers run.
+
+1. **One count exchange per step.** Before the schedule starts, the training step hashes the
+   token rows of all its microbatches for every Engram layer and routes the requests to the
+   owners of the rows. All the request counts go through one all-to-all and one transfer to the
+   host. The inline lookup exchanges its counts and reads them on the host in every lookup. The
+   token prefetch reads the batches of the step ahead for this, also on a rank that has no
+   pipeline or tensor-parallel peer.
+2. **Lookup before the embedding.** `HybridModel.forward` issues the lookup of each of its
+   Engram layers before the embedding: the request all-to-all, the owners' gather and the
+   return all-to-all. They run on one dedicated CUDA stream and on a second NCCL communicator
+   over the ranks of the row group. NCCL runs the operations of one communicator in order, and
+   the row group's own communicator also carries traffic of the compute stream: the MoE
+   all-to-alls in the EP layout, the gradient reductions when the row group is the whole dp_cp
+   group. The model builder creates the group of the second communicator on every rank before
+   it builds the model. The ranks of the first pipeline stage, which holds the embedding, run
+   one collective on it then, so that NCCL sets the communicator up before the first step. The
+   Engram layer waits for its lookup and runs only the fusion.
+3. **No lookup in a recompute.** Under full activation recomputation, the lookup stays bound to
+   its microbatch. A recomputed Engram layer fuses the same rows again and repeats neither the
+   lookup nor its all-to-alls.
+4. **Table gradients off the compute stream.** As soon as the backward of an Engram layer has
+   produced the gradient of its rows, the return all-to-all, the owners' table backward and
+   the gradient accumulation start on the lookup stream, while the compute stream goes on with
+   the layers in front. DDP accumulates the table gradients on the lookup stream. The compute
+   stream waits for the lookup stream when the backward reaches the embedding output, or right
+   at the Engram layer when the embedding output takes no gradient. DDP waits for the lookup
+   stream before it reduces a bucket that holds table gradients, and again before it hands
+   the reduced gradients on, also when a replica group of one rank has nothing to reduce.
+
+The asynchronous lookup runs the operations of the inline lookup on the same data, so losses
+and gradients are bitwise identical to those of the inline lookup
+(`tests/unit_tests/models/engram/test_async_lookup.py`). Evaluation looks the rows up inside the
+layers.
+
+Requirements and limits:
+
+- The `nccl` backend: the EP layout, or the DP x CP layout with
+  `--engram-communication-backend nccl`. The `symmetric` backend and `--fake-process-group` are
+  rejected at startup.
+- CUDA, and the model builder of `pretrain_hybrid.py`, which creates the communicators.
+- Every Engram layer must be in the pipeline and virtual pipeline stage that holds the
+  embedding, where the token IDs enter the model: the first `|` segment of
+  `--hybrid-layer-pattern`, or the first pipeline stage's layers of a pattern without
+  separators. Any other placement is rejected at startup, on every rank.
+- Rows with document boundaries (`--sft`, `--dataloader-inter-document-masking`) are hashed with
+  the boundaries of their batch, so their steps are not planned: each microbatch exchanges its
+  own counts, on the lookup stream. Under context parallelism with different
+  `--linear-cp-layout` and `--attention-cp-layout`, such rows are looked up inside the layers.
+- The second communicator is one more NCCL communicator per row group on the first pipeline
+  stage, with device memory of its own outside PyTorch's allocator, and the lookup stream
+  keeps reserved PyTorch memory of its own, see [Memory](#memory).
+- With `--overlap-param-gather`, the first lookup of a step waits for the parameter gather of
+  the tables before the embedding runs. The inline lookup waits for it at the Engram layer.
+
 ## Limitations
 
 Rejected at startup, unless noted:
@@ -357,7 +431,9 @@ Rejected at startup, unless noted:
   `--linear-cp-layout` and `--attention-cp-layout` differ;
 - `--overlap-moe-expert-parallel-comm`, `--moe-shortcut-connection`,
   `--moe-expert-rank-capacity-factor`, wide residuals and muP;
-- hash-routed MoE layers together with sequence parallelism.
+- hash-routed MoE layers together with sequence parallelism;
+- `--engram-async-lookup` with the `symmetric` backend or with `--fake-process-group`, and with
+  an Engram layer outside the pipeline and virtual pipeline stage of the embedding.
 
 Engram tables are plain PyTorch parameters in the model's parameter dtype. Request
 deduplication across microbatches, prefetching the rows of a later microbatch and FP8 table

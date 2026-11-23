@@ -708,6 +708,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
             "tests/unit_tests/distributed/test_parameter_domains.py",
+            "tests/unit_tests/distributed/test_gradient_streams.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
@@ -717,7 +718,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replay, including changing factors and low-precision gradient buffers. "
         "test_parameter_domains reduces the buffers of an extra parameter domain over its "
         "replica group exactly, by all-reduce and reduce-scatter, overlapped or not, including "
-        "single-rank replica groups, whose collectives are skipped.",
+        "single-rank replica groups, whose collectives are skipped. "
+        "test_gradient_streams reduces a bucket whose gradients accumulate on two CUDA streams "
+        "exactly like one whose gradients accumulate on a single stream.",
     ),
     KernelEntry(
         name="nccl_allocator",
@@ -1146,6 +1149,27 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "integer gradients, and that the source stays byte-identical to PR 8225's; "
         "test_table_sharding_optimizer trains both layouts through DDP and the distributed "
         "optimizer and compares them bit for bit.",
+    ),
+    KernelEntry(
+        name="engram_routed_lookup",
+        sources=("megatron/core/models/engram/routed_lookup.py",),
+        tests=(
+            "tests/unit_tests/models/engram/test_lookup_counts.py",
+            "tests/unit_tests/models/engram/test_routed_lookup.py",
+            "tests/unit_tests/models/engram/test_async_lookup.py",
+        ),
+        kind="torch-op",
+        notes="scatter_add_ of int64 ones counts the integer per-(owner, table) requests of a "
+        "lookup; integer sums do not depend on the order of accumulation. test_lookup_counts "
+        "compares the counts with torch.bincount exactly on CPU and GPU, with and without "
+        "deterministic algorithms. The routed lookup runs the all-to-alls and the owner-side "
+        "table lookups of engram_embedding's forward as separate steps; test_routed_lookup "
+        "compares its rows, table gradients and exchanged buffers with that forward bit for "
+        "bit at EP2 and EP4, in both modes of the table lookup. test_async_lookup issues the "
+        "routed lookup and its backward on a CUDA stream and a communicator of their own "
+        "(megatron/core/models/engram/async_lookup.py, which launches no kernel itself) and "
+        "compares the outputs and DDP's reduced gradients of a step with the inline lookup's "
+        "bit for bit, in both table layouts, and in both modes for the expert-parallel layout.",
     ),
     KernelEntry(
         name="engram_symmetric_lookup",

@@ -11,6 +11,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.engram import (
     EngramConfig,
     apply_engram_to_hybrid_stack_spec,
+    initialize_engram_lookup_groups,
     initialize_engram_parallel_state,
     initialize_engram_transports,
 )
@@ -318,6 +319,11 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         # Collective over every rank, so it runs here and not in build_model: it creates the
         # sharded Engram table groups on the pg_collection that the model stages and DDP share.
         initialize_engram_parallel_state(pg_collection, self._model_config.engram_config)
+        # Collective over every rank too, when the memory is configured with async_lookup: it
+        # creates the communicators of the lookups issued ahead, over the row groups set up
+        # above. An Engram layer takes its communicator when it is built, and a pipeline
+        # stage without one takes part in the creation all the same.
+        initialize_engram_lookup_groups(pg_collection, self._model_config.engram_config)
         composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
         model_list = unimodal_build_distributed_models(
             self.build_model,

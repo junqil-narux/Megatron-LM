@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from dataclasses import dataclass
@@ -476,53 +476,46 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Tra
     return layer_configs
 
 
-def select_pipeline_segment(
+def locate_pipeline_segment(
     main_pattern: str,
-    config: TransformerConfig,
-    pp_group: Optional[torch.distributed.ProcessGroup],
+    pp_rank: int,
+    pp_size: int,
     vp_stage: Optional[int],
     first_stage_layers: Optional[int] = None,
     last_stage_layers: Optional[int] = None,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Tuple[List[TransformerConfig], int]:
-    """Select and validate the pipeline segment for the given PP rank and VP stage.
+) -> Tuple[str, int, Optional[int]]:
+    """Locate the pipeline segment of one PP rank and VP stage in the main pattern.
 
-    When the main pattern contains '|' pipe separators, splits by '|' into
-    pipeline segments and selects the segment for the current PP rank / VP stage.
-
-    When the pattern has no pipes but pp_size > 1, falls back to runtime layer
-    slicing (for backwards compatibility), supporting both even and uneven PP splits
-    via first_stage_layers / last_stage_layers.
+    This is the allocation rule of ``select_pipeline_segment``, which builds the segment of
+    the calling rank. It takes the PP rank and size instead of a process group and neither
+    communicates nor logs, so every rank can evaluate it for any segment, for instance to
+    check where a layer is placed before any model is built.
 
     Args:
         main_pattern: Main decoder pattern (may contain '|' separators).
             Empty string is allowed (produces one empty segment).
-        config: Normalized stack-level config to copy for each selected layer.
-        pp_group: Pipeline parallel process group, or None if not using PP.
-        vp_stage: Virtual pipeline stage, or None if not using VPP.
+        pp_rank: Pipeline parallel rank of the segment.
+        pp_size: Number of pipeline parallel ranks.
+        vp_stage: Virtual pipeline stage of the segment, or None if not using VPP.
         first_stage_layers: Number of layers on the first pipeline stage for
             uneven PP. Only valid when the pattern has no pipe separators.
         last_stage_layers: Number of layers on the last pipeline stage for
             uneven PP. Only valid when the pattern has no pipe separators.
-        tp_group: Optional tensor-parallel process group used for per-stage logging.
-        dp_cp_group: Optional data/context-parallel process group used for per-stage logging.
 
     Returns:
-        Tuple of (layer_config_list, layer_offset) where layer_config_list is
-        the list of independent configs for this segment, and layer_offset
-        is the sum of layer counts from all preceding segments.
+        Tuple of (segment_pattern, layer_offset, segment_index) where segment_pattern
+        holds the layer symbols of the segment, layer_offset is the sum of layer counts
+        from all preceding segments, and segment_index is the position of the segment
+        among the pipe-delimited ones, or None when a pattern without pipes is sliced
+        over the PP ranks.
 
     Raises:
-        ValueError: If the segment contains invalid layer symbols, if
-            first/last_stage_layers are used with pipe separators, if VPP is
-            requested without pipe separators, or if layer counts are not
-            evenly divisible across pipeline stages.
+        ValueError: If first/last_stage_layers are used with pipe separators, if VPP is
+            requested without pipe separators, if a pattern without pipes that is sliced
+            over several PP ranks contains invalid layer symbols, or if layer or segment
+            counts are not evenly divisible across pipeline stages.
     """
     segments = main_pattern.split(Symbols.PIPE) if main_pattern else ['']
-
-    pp_rank = torch.distributed.get_rank(pp_group) if pp_group is not None else 0
-    pp_size = torch.distributed.get_world_size(pp_group) if pp_group is not None else 1
 
     if len(segments) > 1 and (first_stage_layers is not None or last_stage_layers is not None):
         raise ValueError(
@@ -540,14 +533,6 @@ def select_pipeline_segment(
                 "Add '|' separators to define explicit pipeline/virtual-pipeline "
                 "stage boundaries."
             )
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            "DEPRECATION: Using hybrid_layer_pattern without pipe ('|') separators "
-            "with pipeline_model_parallel_size > 1 is deprecated. Please add '|' "
-            "separators to explicitly define pipeline stage boundaries. "
-            "Example: 'M*M*M*M*' with pp_size=2 should become 'M*M*|M*M*'.",
-        )
         full_pattern = segments[0]
         _validate_pattern(full_pattern)
         num_layers = len(full_pattern)
@@ -593,19 +578,7 @@ def select_pipeline_segment(
             offset = pp_rank * layers_per_rank
             count = layers_per_rank
 
-        selected_pattern = full_pattern[offset : offset + count]
-        layer_utils.validate_tp_comm_overlap(config, selected_pattern)
-        selected = validate_segment_layers(selected_pattern, config)
-        log_on_each_pipeline_stage(
-            logger,
-            logging.INFO,
-            f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
-            f"layers='{selected_pattern}' ({len(selected)} layers), "
-            f"layer_offset={offset} (auto-split)",
-            tp_group=tp_group,
-            dp_cp_group=dp_cp_group,
-        )
-        return selected, offset
+        return full_pattern[offset : offset + count], offset, None
 
     # Pipe-based segment selection
     if len(segments) > 1 and len(segments) % pp_size != 0:
@@ -627,20 +600,91 @@ def select_pipeline_segment(
         )
 
     layer_offset = sum(len(segments[i]) for i in range(segment_index))
-    my_segment = segments[segment_index]
+    return segments[segment_index], layer_offset, segment_index
+
+
+def select_pipeline_segment(
+    main_pattern: str,
+    config: TransformerConfig,
+    pp_group: Optional[torch.distributed.ProcessGroup],
+    vp_stage: Optional[int],
+    first_stage_layers: Optional[int] = None,
+    last_stage_layers: Optional[int] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Tuple[List[TransformerConfig], int]:
+    """Select and validate the pipeline segment for the given PP rank and VP stage.
+
+    When the main pattern contains '|' pipe separators, splits by '|' into
+    pipeline segments and selects the segment for the current PP rank / VP stage.
+
+    When the pattern has no pipes but pp_size > 1, falls back to runtime layer
+    slicing (for backwards compatibility), supporting both even and uneven PP splits
+    via first_stage_layers / last_stage_layers.
+
+    The segment is located by ``locate_pipeline_segment``.
+
+    Args:
+        main_pattern: Main decoder pattern (may contain '|' separators).
+            Empty string is allowed (produces one empty segment).
+        config: Normalized stack-level config to copy for each selected layer.
+        pp_group: Pipeline parallel process group, or None if not using PP.
+        vp_stage: Virtual pipeline stage, or None if not using VPP.
+        first_stage_layers: Number of layers on the first pipeline stage for
+            uneven PP. Only valid when the pattern has no pipe separators.
+        last_stage_layers: Number of layers on the last pipeline stage for
+            uneven PP. Only valid when the pattern has no pipe separators.
+        tp_group: Optional tensor-parallel process group used for per-stage logging.
+        dp_cp_group: Optional data/context-parallel process group used for per-stage logging.
+
+    Returns:
+        Tuple of (layer_config_list, layer_offset) where layer_config_list is
+        the list of independent configs for this segment, and layer_offset
+        is the sum of layer counts from all preceding segments.
+
+    Raises:
+        ValueError: If the segment contains invalid layer symbols, if
+            first/last_stage_layers are used with pipe separators, if VPP is
+            requested without pipe separators, or if layer counts are not
+            evenly divisible across pipeline stages.
+    """
+    num_segments = len(main_pattern.split(Symbols.PIPE)) if main_pattern else 1
+
+    pp_rank = torch.distributed.get_rank(pp_group) if pp_group is not None else 0
+    pp_size = torch.distributed.get_world_size(pp_group) if pp_group is not None else 1
+
+    if num_segments == 1 and pp_size > 1 and vp_stage is None:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "DEPRECATION: Using hybrid_layer_pattern without pipe ('|') separators "
+            "with pipeline_model_parallel_size > 1 is deprecated. Please add '|' "
+            "separators to explicitly define pipeline stage boundaries. "
+            "Example: 'M*M*M*M*' with pp_size=2 should become 'M*M*|M*M*'.",
+        )
+
+    my_segment, layer_offset, segment_index = locate_pipeline_segment(
+        main_pattern, pp_rank, pp_size, vp_stage, first_stage_layers, last_stage_layers
+    )
 
     layer_utils.validate_tp_comm_overlap(config, my_segment)
     layer_config_list = validate_segment_layers(my_segment, config)
 
+    if segment_index is None:
+        segment_description = (
+            f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
+            f"layers='{my_segment}' ({len(layer_config_list)} layers), "
+            f"layer_offset={layer_offset} (auto-split)"
+        )
+    else:
+        segment_description = (
+            f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage or 0}, "
+            f"segment_index={segment_index}/{num_segments}, "
+            f"layers='{my_segment}' ({len(layer_config_list)} layers), "
+            f"layer_offset={layer_offset}"
+        )
     log_on_each_pipeline_stage(
-        logger,
-        logging.INFO,
-        f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rel}, "
-        f"segment_index={segment_index}/{len(segments)}, "
-        f"layers='{my_segment}' ({len(layer_config_list)} layers), "
-        f"layer_offset={layer_offset}",
-        tp_group=tp_group,
-        dp_cp_group=dp_cp_group,
+        logger, logging.INFO, segment_description, tp_group=tp_group, dp_cp_group=dp_cp_group
     )
 
     return layer_config_list, layer_offset

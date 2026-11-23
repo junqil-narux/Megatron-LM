@@ -8,6 +8,7 @@
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -632,6 +633,7 @@ class HybridStack(MegatronModule):
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
+        engram_lookups: Optional[dict] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -650,6 +652,10 @@ class HybridStack(MegatronModule):
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed and
                 Engram-owning TransformerLayer instances and custom layers. Defaults to None.
                 Custom layers must accept None; HybridModel does not forward IDs to MTP stacks.
+            engram_lookups (dict, optional): Engram lookups issued ahead of this forward, keyed
+                by layer number (``EngramConfig.async_lookup``). Each is bound to its layer's
+                Engram module for the layer's call, which then runs only the fusion. A layer
+                without an entry looks its rows up itself. Defaults to None.
         Returns:
             Tensor: the output tensor.
         """
@@ -767,6 +773,14 @@ class HybridStack(MegatronModule):
             else [None] * self.num_layers_per_pipeline_rank
         )
 
+        engram_lookup_context = None
+        if engram_lookups:
+            # Imported on use: the hybrid package and the Engram package reach each other
+            # only from inside functions, so neither import order closes a cycle.
+            from megatron.core.models.engram.async_lookup import use_prefetched_lookup
+
+            engram_lookup_context = partial(use_prefetched_lookup, lookups=engram_lookups)
+
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
@@ -784,6 +798,9 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    # Entered again when a layer is recomputed, so the recompute fuses the
+                    # lookup of its microbatch instead of looking the rows up again.
+                    layer_context=engram_lookup_context,
                 )
             else:
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
@@ -860,7 +877,12 @@ class HybridStack(MegatronModule):
                                 input_ids,
                                 sequence_parallel_local=not uses_engram,
                             )
-                        with inner_quant_context:
+                        layer_engram_lookup = (
+                            engram_lookup_context(layer)
+                            if engram_lookup_context is not None
+                            else nullcontext()
+                        )
+                        with inner_quant_context, layer_engram_lookup:
                             if is_custom_layer and not isinstance(
                                 layer, HyperConnectionHybridLayer
                             ):
