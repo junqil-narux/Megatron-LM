@@ -221,7 +221,7 @@ def _startup_transformer_config(**overrides):
     return SimpleNamespace(**values)
 
 
-def _startup_engram_config(tmp_path, layer_ids=(1,)):
+def _startup_engram_config(tmp_path, layer_ids=(1,), **overrides):
     artifact = write_tokenizer_map(tmp_path / "map.json", vocab_size=16, layer_ids=layer_ids)
     return EngramConfig(
         global_vocab_sizes=(17, 19),
@@ -233,7 +233,57 @@ def _startup_engram_config(tmp_path, layer_ids=(1,)):
         hash_seed=0,
         boundary_token_id=0,
         tokenizer_map_path=str(artifact),
+        **overrides,
     )
+
+
+def test_async_lookup_requires_the_nccl_lookup(tmp_path, monkeypatch):
+    """A configuration built in code follows the backend rule that the command line checks."""
+    # The expert-parallel layout, and a sharded one that names the NCCL lookup.
+    _startup_engram_config(tmp_path, async_lookup=True)
+    _startup_engram_config(
+        tmp_path, async_lookup=True, parallel_size=4, communication_backend="nccl"
+    )
+    # The sharded layout's default is the symmetric transport, which is checked for CUDA first.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    with pytest.raises(ValueError, match="engram_async_lookup requires"):
+        _startup_engram_config(tmp_path, async_lookup=True, parallel_size=4)
+
+
+@pytest.mark.parametrize(
+    "pattern, stage_options, on_chunk, off_chunk",
+    [
+        # Two pipeline stages of two layers each.
+        ("--|--", {}, (1, 2), (2, 3)),
+        # Two virtual chunks per stage. The segments are ordered by chunk, then by stage, so
+        # the third one is the second chunk of the embedding's own stage.
+        ("-|-|-|-", {}, (1,), (3,)),
+        # No separators: the layers are split evenly, or as the first-stage count says.
+        ("----", {}, (1, 2), (3,)),
+        ("----", dict(num_layers_in_first_pipeline_stage=1), (1,), (2,)),
+    ],
+    ids=["pipeline_stages", "virtual_chunks", "even_split", "first_stage_count"],
+)
+def test_async_lookup_needs_the_memory_on_the_chunk_of_the_embedding(
+    tmp_path, pattern, stage_options, on_chunk, off_chunk
+):
+    """The lookups are issued in front of the embedding, so a memory layer on another pipeline
+    stage or virtual chunk is rejected from the configuration alone, on every rank alike."""
+    transformer_config = _startup_transformer_config(
+        num_layers=4, pipeline_model_parallel_size=2, **stage_options
+    )
+
+    def validate(layer_ids, hybrid_layer_pattern=pattern, **options):
+        config = _startup_engram_config(tmp_path, layer_ids=layer_ids, **options)
+        config.validate_startup(transformer_config, 16, hybrid_layer_pattern=hybrid_layer_pattern)
+
+    validate(on_chunk, async_lookup=True)
+    with pytest.raises(ValueError, match=rf"engram_layer_ids \[{off_chunk[-1]}\] are on later"):
+        validate(off_chunk, async_lookup=True)
+    # The inline lookup runs on any chunk, and a model without a pattern is checked when its
+    # chunks are built.
+    validate(off_chunk)
+    validate(off_chunk, hybrid_layer_pattern=None, async_lookup=True)
 
 
 @pytest.mark.parametrize("pipeline_model_parallel_size", [2, 4])

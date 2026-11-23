@@ -584,6 +584,29 @@ def _validate_engram_communication_backend(args):
     )
 
 
+def _validate_engram_async_lookup(args):
+    """Reject the setups in which --engram-async-lookup cannot issue the Engram lookups ahead.
+
+    Called once --engram-communication-backend is resolved: the lookups issued ahead are the NCCL
+    all-to-alls, on a second communicator over the ranks that shard the tables (see
+    EngramConfig.async_lookup in megatron/core/models/engram/config.py).
+    """
+    if not getattr(args, 'engram_async_lookup', False):
+        return
+    assert getattr(
+        args, 'engram_enabled', False
+    ), '--engram-async-lookup requires Engram (--engram-vocab-sizes).'
+    assert getattr(args, 'engram_communication_backend', None) == 'nccl', (
+        '--engram-async-lookup requires --engram-communication-backend nccl: only the NCCL '
+        'all-to-all lookup can be issued ahead of the Engram layers, and the symmetric transport '
+        '(the default with --engram-parallel-size above 1) cannot.'
+    )
+    assert not getattr(args, 'fake_process_group', False), (
+        '--engram-async-lookup creates a second NCCL communicator over the ranks that shard the '
+        'tables and cannot run on a fake process group, which starts none of the other ranks.'
+    )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion. CheckpointConfig.validate() checks the prerequisites below;
@@ -1841,6 +1864,7 @@ def validate_args(args, defaults={}):
     if getattr(args, "engram_parallel_size", None) is not None:
         _validate_engram_parallel_size(args)
     _validate_engram_communication_backend(args)
+    _validate_engram_async_lookup(args)
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -3718,6 +3742,19 @@ def _add_engram_args(parser):
         default=64,
         help='Size in MiB of the workspace that the Engram symmetric transport registers on '
         'every rank: the staging and receive slots of its exchanges.',
+    )
+    group.add_argument(
+        '--engram-async-lookup',
+        action='store_true',
+        help='Issue the Engram lookups of a training microbatch before the embedding instead of '
+        'inside the Engram layers, on a CUDA stream and an NCCL communicator of their own, so '
+        'that they overlap the layers in front of the Engram layers. The request counts of a '
+        'step are exchanged once at its start (per microbatch for rows with document '
+        'boundaries), a full recompute does not repeat the lookup, and its backward runs off the '
+        'compute stream. The results equal the inline lookup bit for bit, and evaluation keeps '
+        'the inline lookup. Requires the NCCL lookup (--engram-communication-backend nccl with '
+        '--engram-parallel-size above 1) and the Engram layers on the pipeline stage that holds '
+        'the embedding; does not run on a fake process group.',
     )
     return parser
 

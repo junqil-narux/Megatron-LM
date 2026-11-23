@@ -27,6 +27,15 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
             "(pretrain_hybrid.py), which creates the Engram table groups on every rank before "
             "building the model; the hybrid_builder model provider does not."
         )
+    if getattr(args, 'engram_async_lookup', False):
+        # The lookups issued ahead run on a communicator of their own, created by a collective
+        # over every rank before the model is built. As for the table groups above, only
+        # HybridModelBuilder.build_distributed_models does that.
+        raise NotImplementedError(
+            "--engram-async-lookup is supported only by the HybridModelBuilder path "
+            "(pretrain_hybrid.py), which creates the lookup communicator on every rank before "
+            "building the model; the hybrid_builder model provider does not."
+        )
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
 
