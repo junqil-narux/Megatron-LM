@@ -1,9 +1,9 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Dict, List, Optional
 
 import torch
@@ -623,10 +623,21 @@ class DistributedDataParallel(_BaseDataParallel):
                                     )
                                     break
                 else:
-                    # Expand so we get access to grad_fn.
-                    param_tmp = param.expand_as(param)
-                    # Get the gradient accumulator function.
-                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                    # The gradient accumulator runs on the stream that is current when it is
+                    # created, here. A parameter whose gradient is produced on another stream
+                    # names that stream, so that its accumulation does not make the current
+                    # stream wait for the producing one.
+                    accumulation_stream = getattr(param, 'grad_accumulation_stream', None)
+                    stream_context = (
+                        torch.cuda.stream(accumulation_stream)
+                        if accumulation_stream is not None
+                        else nullcontext()
+                    )
+                    with stream_context:
+                        # Expand so we get access to grad_fn.
+                        param_tmp = param.expand_as(param)
+                        # Get the gradient accumulator function.
+                        grad_acc = param_tmp.grad_fn.next_functions[0][0]
                     if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
                         param, 'register_grad_accum_hook'
                     ):
