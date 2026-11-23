@@ -7,6 +7,7 @@ Transformer Engine modules; the integration tests replace the expensive layers w
 around the real TransformerLayer, HybridStack, HybridModel and hyper-connection wrapper paths.
 """
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -29,6 +30,8 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import checkpointed_forward
+from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -367,6 +370,80 @@ def test_hybrid_stack_passes_token_ids_to_engram_layers_only(monkeypatch, full_r
     assert engram_layer.calls[0]["input_ids"] is input_ids
     # Layers without a memory or hash router keep their exact kwarg set.
     assert "input_ids" not in plain_layer.calls[0]
+
+
+@pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+def test_checkpointed_forward_enters_the_layer_context_again_in_the_recompute(
+    monkeypatch, recompute_method
+):
+    """A layer's context wraps its call in the checkpointed forward, which runs without
+    gradients, and wraps it again when the backward recomputes the layer."""
+    if not torch.cuda.is_available():
+        # The checkpoint snapshots the CUDA generators; without a device, only the CPU one.
+        monkeypatch.setattr(
+            tensor_parallel_random, "_get_all_rng_states", lambda: (torch.get_rng_state(),)
+        )
+        monkeypatch.setattr(
+            tensor_parallel_random,
+            "_set_all_rng_states",
+            lambda cpu_rng_state, *others, **kind: torch.set_rng_state(cpu_rng_state),
+        )
+    events = []
+
+    class _DoublingLayer(_RecordingLayer):
+        def forward(self, hidden_states, **kwargs):
+            events.append(("call", self.layer_number, torch.is_grad_enabled()))
+            return 2.0 * hidden_states, None
+
+    @contextmanager
+    def layer_context(layer):
+        events.append(("enter", layer.layer_number, torch.is_grad_enabled()))
+        try:
+            yield
+        finally:
+            events.append(("exit", layer.layer_number, torch.is_grad_enabled()))
+
+    def around_call(layer_number, grad_enabled):
+        return [(event, layer_number, grad_enabled) for event in ("enter", "call", "exit")]
+
+    stack = _make_stack(
+        [_DoublingLayer(layer_number=layer_number) for layer_number in (1, 2, 3)],
+        Symbols.ATTENTION * 3,
+        recompute_granularity="full",
+        recompute_method=recompute_method,
+        recompute_num_layers=2,
+    )
+    hidden_states = torch.randn(4, 2, 8, requires_grad=True)
+
+    output = checkpointed_forward(
+        stack,
+        hidden_states=hidden_states,
+        attention_mask=None,
+        context=None,
+        context_mask=None,
+        rotary_pos_emb=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        use_inner_quantization_context=False,
+        layer_context=layer_context,
+    )
+    forward_events = list(events)
+    events.clear()
+    output.sum().backward()
+
+    if recompute_method == "uniform":
+        # Layers 1 and 2 share a checkpoint and layer 3 has its own, which is recomputed first.
+        assert forward_events == (
+            around_call(1, False) + around_call(2, False) + around_call(3, False)
+        )
+        assert events == around_call(3, True) + around_call(1, True) + around_call(2, True)
+    else:
+        # Layers 1 and 2 have a checkpoint each; layer 3 runs once, outside any checkpoint.
+        assert forward_events == (
+            around_call(1, False) + around_call(2, False) + around_call(3, True)
+        )
+        assert events == around_call(2, True) + around_call(1, True)
+    assert torch.equal(hidden_states.grad, torch.full_like(hidden_states, 8.0))
 
 
 @pytest.mark.parametrize("tp_rank", [0, 1])
