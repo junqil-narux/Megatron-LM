@@ -774,7 +774,8 @@ class PipelineTokenPrefetchIterator:
 
     When a single rank holds the whole schedule there is nothing to distribute, so
     ``token_spec`` is set instead of ``pipeline_tokens`` and each microbatch's tokens are
-    derived on demand from the batch the scheduler just consumed.
+    derived on demand from the batch the scheduler just consumed, unless the caller asked for
+    the whole step's tokens ahead of the schedule.
     """
 
     def __init__(
@@ -803,6 +804,14 @@ class PipelineTokenPrefetchIterator:
         self._last_batch = batch
         return batch
 
+    def peek_pipeline_tokens(self) -> list[torch.Tensor]:
+        """Return the tokens of the microbatches still to be scheduled, in order.
+
+        Nothing is consumed. The list is empty when the tokens are derived on demand
+        (``token_spec``), since none are prepared ahead then.
+        """
+        return list(self._pipeline_tokens)
+
     def pop_pipeline_tokens(self) -> torch.Tensor:
         """Return the tokens prepared for the next scheduled microbatch.
 
@@ -830,6 +839,7 @@ def prepare_tokens_for_pipeline(
     sequence_length: int,
     pp_group,
     tp_group,
+    prefetch_all: bool = False,
 ) -> PipelineTokenPrefetchIterator:
     """Distribute every Engram microbatch's tokens before pipeline scheduling starts.
 
@@ -840,6 +850,13 @@ def prepare_tokens_for_pipeline(
     tensor to its TP peers; each TP coordinate then broadcasts to the matching PP group. Data
     availability is broadcast first so an exhausted iterator fails on every rank instead of
     hanging the peers inside the token broadcast.
+
+    ``prefetch_all`` reads the step's microbatches up front also when a single rank holds the
+    whole schedule, for a caller that needs every microbatch's tokens before the schedule
+    starts (see ``PipelineTokenPrefetchIterator.peek_pipeline_tokens``). Such a rank has no
+    peer to tell about its data: it broadcasts no availability flag and reads none back from
+    the device, and a failure of the read, the data iterator's ``StopIteration`` included,
+    reaches the caller as it is, before the schedule starts.
     """
     # Under VPP the scheduler hands each model chunk its own iterator and indexes the list
     # itself before calling forward_step, so every chunk ends up with its own wrapper and no
@@ -873,9 +890,11 @@ def prepare_tokens_for_pipeline(
     source_failure = None
     source_exception = None
 
-    if pp_size == 1 and tp_size == 1:
-        # Nothing to distribute: draining the schedule's whole global batch up front would
-        # only hold every microbatch resident for no benefit.
+    single_rank = pp_size == 1 and tp_size == 1
+    if single_rank and not prefetch_all:
+        # Nothing to distribute, and nothing asks for the tokens ahead of the schedule:
+        # draining the schedule's whole global batch up front would only hold every
+        # microbatch resident for no benefit.
         return _wrap([], [], token_spec=(micro_batch_size, sequence_length, device))
 
     if pp_rank == 0 and tp_rank == 0:
@@ -891,8 +910,14 @@ def prepare_tokens_for_pipeline(
                 )
             stacked_tokens = torch.stack(microbatch_tokens).contiguous()
         except StopIteration:
+            if single_rank:
+                # No peer waits for this rank's data: the caller gets the iterator's own
+                # StopIteration, as the schedule does without prefetch_all.
+                raise
             source_failure = "the Engram data iterator was exhausted during token prefetch"
         except Exception as error:  # pylint: disable=broad-except
+            if single_rank:
+                raise
             # Any source-side prefetch failure must reach the peers through the availability
             # flag, or they hang in the token broadcast until the NCCL watchdog fires.
             source_failure = f"Engram token prefetch failed on the source rank: {error}"
@@ -901,6 +926,11 @@ def prepare_tokens_for_pipeline(
         stacked_tokens = torch.empty(
             (num_microbatches, *padded_shape), dtype=torch.int64, device=device
         )
+
+    if single_rank:
+        # prefetch_all on a rank without peers: the read above succeeded, and nobody receives
+        # an availability flag, so none is built and no device tensor is read on the host.
+        return _wrap(stacked_tokens.unbind(0), prefetched_batches)
 
     def _broadcast_from_source(tensor, group):
         return torch.distributed.broadcast(
