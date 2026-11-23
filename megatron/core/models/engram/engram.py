@@ -679,6 +679,94 @@ class Engram(MegatronModule):
             dim=0,
         )
 
+    def _local_sequence_length(self, row_length: int) -> int:
+        """Return the length of the hidden states that a token row of ``row_length`` is fused into.
+
+        The hidden states are sliced over TP under sequence parallelism; the row is not.
+        """
+        tp_size = get_pg_size(self.tp_group)
+        if self.config.sequence_parallel and tp_size > 1:
+            return row_length // tp_size
+        return row_length
+
+    def _hash_ids(
+        self,
+        input_ids: Tensor,
+        row_cu_seqlens: Tensor | None,
+        document_lengths: Tensor | None,
+        local_sequence_length: int,
+        input_is_global: bool = False,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Hash a token row and return the table row IDs of this rank's positions.
+
+        ``input_ids`` is this rank's ``[B, S]`` row in the layer's context-parallel layout. With
+        ``input_is_global`` it is the globally ordered row instead, as
+        :func:`_gather_tokens_across_cp` restores it, and no token is gathered: a caller that
+        holds that row passes it and keeps the context-parallel collective out of this step.
+        ``row_cu_seqlens`` and ``document_lengths`` are the document bounds of a packed row
+        (:func:`_row_document_bounds`), and ``local_sequence_length`` is the length of the hidden
+        states the rows are fused into.
+
+        Returns the ``[B, local_sequence_length, num_tables]`` row IDs and, for the gated fusion
+        of a packed row, the ``[1, local_sequence_length, 1]`` mask of the positions that hold a
+        token; the mask is None otherwise.
+        """
+        cp_size = get_pg_size(self.cp_group)
+        message = "engram.hash"
+        nvtx_range_push(message)
+        try:
+            # Hash windows and the causal convolution both read positions that CP may have
+            # placed on another rank, so the memory is computed on the restored global
+            # sequence and re-selected afterwards. input_ids is a small int64 tensor, so the
+            # gather costs far less than threading a second token channel through the model.
+            if cp_size > 1 and not input_is_global:
+                global_input_ids = _gather_tokens_across_cp(
+                    input_ids,
+                    self.cp_group,
+                    row_cu_seqlens,
+                    contiguous=self.cp_layout == CONTIGUOUS_CP_LAYOUT,
+                )
+            else:
+                global_input_ids = input_ids
+            hash_ids = build_ngram_hashes(
+                input_ids=global_input_ids,
+                tokenizer_remap=self.tokenizer_remap,
+                multipliers=self.hash_multipliers,
+                table_sizes=self.table_sizes,
+                max_ngram_order=self.engram_config.max_ngram_order,
+                num_hash_heads=self.engram_config.num_hash_heads,
+                boundary_token_id=self.engram_config.hash_boundary_token_id,
+                reset_at_boundary=self.engram_config.variant_spec.resets_windows_at_boundary_token,
+                cu_seqlens=row_cu_seqlens,
+            )
+            hash_ids = self._select_local_positions(hash_ids, row_cu_seqlens, local_sequence_length)
+            valid = None
+            if self._gated_fusion and row_cu_seqlens is not None:
+                # A position after the last document boundary belongs to no document, and a
+                # position in the padding of a document holds no token.
+                valid = self._select_local_positions(
+                    valid_positions_from_cu_seqlens(
+                        row_cu_seqlens, global_input_ids.shape[1], document_lengths
+                    ).view(1, -1, 1),
+                    row_cu_seqlens,
+                    local_sequence_length,
+                )
+            return hash_ids, valid
+        finally:
+            nvtx_range_pop(message)
+
+    def _lookup_memory(self, hash_ids: Tensor) -> Tensor:
+        """Look the rows of ``hash_ids`` up and return them as ``[S_local, B, total_memory_dim]``.
+
+        The rows carry the gradient edge to the tables.
+        """
+        message = "engram.lookup"
+        nvtx_range_push(message)
+        try:
+            return self._lookup(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+        finally:
+            nvtx_range_pop(message)
+
     def lookup(
         self,
         input_ids: Tensor,
@@ -710,58 +798,11 @@ class Engram(MegatronModule):
         if cp_size > 1 and row_cu_seqlens is not None:
             self._check_packed_cp_partition(packed_seq_params)
         if local_sequence_length is None:
-            # The hidden states are sliced over TP under sequence parallelism; the row is not.
-            local_sequence_length = input_ids.shape[1]
-            tp_size = get_pg_size(self.tp_group)
-            if self.config.sequence_parallel and tp_size > 1:
-                local_sequence_length //= tp_size
-
-        message = "engram.hash"
-        nvtx_range_push(message)
-        try:
-            # Hash windows and the causal convolution both read positions that CP may have
-            # placed on another rank, so the memory is computed on the restored global
-            # sequence and re-selected afterwards. input_ids is a small int64 tensor, so the
-            # gather costs far less than threading a second token channel through the model.
-            if cp_size > 1:
-                global_input_ids = _gather_tokens_across_cp(
-                    input_ids, self.cp_group, row_cu_seqlens, contiguous=contiguous_cp
-                )
-            else:
-                global_input_ids = input_ids
-            hash_ids = build_ngram_hashes(
-                input_ids=global_input_ids,
-                tokenizer_remap=self.tokenizer_remap,
-                multipliers=self.hash_multipliers,
-                table_sizes=self.table_sizes,
-                max_ngram_order=self.engram_config.max_ngram_order,
-                num_hash_heads=self.engram_config.num_hash_heads,
-                boundary_token_id=self.engram_config.hash_boundary_token_id,
-                reset_at_boundary=self.engram_config.variant_spec.resets_windows_at_boundary_token,
-                cu_seqlens=row_cu_seqlens,
-            )
-            hash_ids = self._select_local_positions(hash_ids, row_cu_seqlens, local_sequence_length)
-            valid = None
-            if self._gated_fusion and row_cu_seqlens is not None:
-                # A position after the last document boundary belongs to no document, and a
-                # position in the padding of a document holds no token.
-                valid = self._select_local_positions(
-                    valid_positions_from_cu_seqlens(
-                        row_cu_seqlens, global_input_ids.shape[1], document_lengths
-                    ).view(1, -1, 1),
-                    row_cu_seqlens,
-                    local_sequence_length,
-                )
-        finally:
-            nvtx_range_pop(message)
-
-        message = "engram.lookup"
-        nvtx_range_push(message)
-        try:
-            memory = self._lookup(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
-        finally:
-            nvtx_range_pop(message)
-        return EngramLookupResult(memory, valid, row_cu_seqlens)
+            local_sequence_length = self._local_sequence_length(input_ids.shape[1])
+        hash_ids, valid = self._hash_ids(
+            input_ids, row_cu_seqlens, document_lengths, local_sequence_length
+        )
+        return EngramLookupResult(self._lookup_memory(hash_ids), valid, row_cu_seqlens)
 
     def forward(
         self,
