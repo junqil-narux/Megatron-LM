@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 import functools
@@ -283,6 +283,23 @@ class _ParamAndGradBucketGroup:
             for param in bucket.params_list:
                 self.param_to_bucket[param] = bucket
                 self.params.add(param)
+
+        # Streams that accumulate gradients into this group, recorded when a parameter names
+        # one. A parameter can name the stream its gradient is produced on
+        # (grad_accumulation_stream): DistributedDataParallel accumulates it there, and the
+        # gradients of the other parameters on the stream it is constructed on, which is the
+        # current one here. start_grad_sync waits for these streams before it reads the buckets,
+        # and finish_grad_sync before it returns the gradients to its caller.
+        self.grad_accumulation_streams = []
+        named_streams = [
+            getattr(param, 'grad_accumulation_stream', None) for param in self.param_to_bucket
+        ]
+        if any(stream is not None for stream in named_streams):
+            construction_stream = torch.cuda.current_stream()
+            for stream in named_streams:
+                stream = construction_stream if stream is None else stream
+                if stream not in self.grad_accumulation_streams:
+                    self.grad_accumulation_streams.append(stream)
 
         self.next_param_gather_bucket_group = None
         # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
@@ -736,6 +753,12 @@ class _ParamAndGradBucketGroup:
                     current_stream.wait_event(event)
                     waited_event_ids.add(id(event))
 
+        # This runs on the caller's stream: that of the parameter whose gradient came last,
+        # when its hook dispatches the reduction. Gradients of the group may still be
+        # accumulating on another stream. Wait for every stream that accumulates into this
+        # group before reading, scaling, or reducing its buckets.
+        self._wait_for_grad_accumulation_streams()
+
         # Copy accumulated .main_grad into communication buffer before collective if
         # .main_grad is not in .grad_data already (e.g., because we want to do local
         # gradient accumulation in a higher precision).
@@ -897,8 +920,19 @@ class _ParamAndGradBucketGroup:
         finalize loop to call this on every bucket without double-waiting. The
         non-overlap path preserves its original per-call dispatch+wait behaviour
         because it has no predecessor draining.
+
+        Every call first makes the calling stream wait for the streams that accumulate
+        gradients into this bucket group (see grad_accumulation_streams), if its parameters
+        name any.
         """
         self.param_gather_dispatched = False
+        # With overlapped reduction, the buckets were accumulated into, scaled and reduced on
+        # the streams of the group's parameters, which need not be the caller's. The handle of
+        # a collective orders the caller's stream after the stream that dispatched it, but an
+        # identity reduction (collectives_are_identity) launches nothing to wait for. So order
+        # the caller's stream after every stream that accumulates into this group here, on every
+        # call: the caller reads the gradients once this returns.
+        self._wait_for_grad_accumulation_streams()
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
@@ -927,6 +961,18 @@ class _ParamAndGradBucketGroup:
         self.grad_reduce_handle = None
         self._copy_back_extra_main_grads()
         self.grad_reduce_finished = True
+
+    def _wait_for_grad_accumulation_streams(self):
+        """Make the current stream wait for every other stream that accumulates into this group.
+
+        A group whose parameters name no gradient stream records none, and this does nothing.
+        """
+        if not self.grad_accumulation_streams:
+            return
+        current_stream = torch.cuda.current_stream()
+        for stream in self.grad_accumulation_streams:
+            if stream != current_stream:
+                current_stream.wait_stream(stream)
 
     def free_overlap_buffers(self):
         """Free GPU buffers used by overlap param gather.

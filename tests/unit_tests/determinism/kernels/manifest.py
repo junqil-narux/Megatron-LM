@@ -708,6 +708,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
             "tests/unit_tests/distributed/test_parameter_domains.py",
+            "tests/unit_tests/distributed/test_gradient_streams.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
@@ -717,7 +718,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replay, including changing factors and low-precision gradient buffers. "
         "test_parameter_domains reduces the buffers of an extra parameter domain over its "
         "replica group exactly, by all-reduce and reduce-scatter, overlapped or not, including "
-        "single-rank replica groups, whose collectives are skipped.",
+        "single-rank replica groups, whose collectives are skipped. "
+        "test_gradient_streams reduces a bucket whose gradients accumulate on two CUDA streams "
+        "exactly like one whose gradients accumulate on a single stream.",
     ),
     KernelEntry(
         name="nccl_allocator",
